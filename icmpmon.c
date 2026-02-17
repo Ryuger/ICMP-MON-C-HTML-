@@ -581,30 +581,29 @@ static int form_get(char* body, const char* key, char* out, int out_sz){
 static void serve_index(SOCKET c){
     const char* html =
         "<!doctype html><html><head><meta charset=utf-8><title>icmpmon</title>"
-        "<style>body{font-family:system-ui;margin:16px}table{border-collapse:collapse;width:100%}th,td{border-bottom:1px solid #ddd;padding:6px;font-size:13px}"
-        ".up{color:green}.down{color:#b00020}.unk{color:#666}.card{border:1px solid #ddd;padding:10px;border-radius:10px;margin-bottom:12px}input,select{font-size:12px}</style></head><body>"
-        "<h2>icmpmon</h2><div id=meta></div>"
+        "<style>body{font-family:system-ui;margin:16px}.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}.tab{padding:6px 10px;border:1px solid #bbb;border-radius:8px;cursor:pointer;background:#fff}.tab.active{background:#1f6feb;color:#fff;border-color:#1f6feb}.card{border:1px solid #ddd;padding:10px;border-radius:10px;margin-bottom:12px}table{border-collapse:collapse;width:100%}th,td{border-bottom:1px solid #ddd;padding:6px;font-size:13px}.subhead{background:#f7f7f7;font-weight:600}.up{color:green}.down{color:#b00020}.unk{color:#666}input,select{font-size:12px}</style></head><body>"
+        "<h2>icmpmon</h2><div id=meta></div><div id=tabs class=tabs></div>"
         "<div class=card><h3>Add host</h3><form id=addf>"
         "Group <input name=group value='Default'> Subgroup <input name=subgroup value='Main'> Host/IP <input name=name required> "
         "Interval ms <input name=interval_ms type=number value=1000 min=50> Timeout ms <input name=timeout_ms type=number value=1000 min=50>"
         " <button>Add</button></form><div id=addmsg></div></div>"
         "<div class=card><h3>Excel (CSV)</h3><button onclick='location.href=\"/api/export.csv\"'>Export CSV</button> <input id=f type=file accept='.csv'> <button onclick='importCsv()'>Import CSV</button> <span id=impmsg></span></div>"
-        "<table><thead><tr><th>ID</th><th>Group</th><th>Subgroup</th><th>Host</th><th>Status</th><th>Interval</th><th>Timeout</th><th>DownThr</th><th>Actions</th></tr></thead><tbody id=tb></tbody></table>"
+        "<table><thead><tr><th>ID</th><th>Group</th><th>Subgroup</th><th>Host/IP</th><th>Status</th><th>Interval</th><th>Timeout</th><th>DownThr</th><th>Loss</th><th>Actions</th></tr></thead><tbody id=tb></tbody></table>"
         "<script>"
-        "let lastData=[];"
+        "let selectedGroup='';"
         "function enc(f){return new URLSearchParams(new FormData(f)).toString()}"
         "function isEditing(){let a=document.activeElement;return !!(a && (a.tagName=='INPUT'||a.tagName=='SELECT'||a.tagName=='TEXTAREA'));}"
-        "function render(j){document.getElementById('meta').textContent=`hosts=${j.hosts} up=${j.up} down=${j.down} unk=${j.unk}`;lastData=j.list;"
-        "let tb=document.getElementById('tb');tb.innerHTML='';for(let h of j.list){let cls=h.st=='UP'?'up':(h.st=='DOWN'?'down':'unk');"
-        "let tr=document.createElement('tr');tr.id='r'+h.id;tr.innerHTML=`<td>${h.id}</td><td><input name=group value='${h.group}'></td><td><input name=subgroup value='${h.subgroup}'></td><td><input name=name value='${h.name}'></td>`+"
-        "`<td class='${cls}'>${h.st}</td><td><input name=interval_ms type=number min=50 value='${h.interval_ms}' style='width:90px'></td><td><input name=timeout_ms type=number min=50 value='${h.timeout_ms}' style='width:90px'></td>`+"
-        "`<td><input name=down_threshold type=number min=1 value='${h.down_threshold}' style='width:70px'></td><td><select name=enabled><option value=1 ${h.enabled?'selected':''}>on</option><option value=0 ${!h.enabled?'selected':''}>off</option></select><button onclick='editHost(${h.id})'>Save</button></td>`;"
-        "tb.appendChild(tr);} }"
+        "function drawTabs(list){let groups=[...new Set(list.map(x=>x.group||'Default'))].sort();if(!selectedGroup&&groups.length)selectedGroup=groups[0];let tabs=document.getElementById('tabs');tabs.innerHTML='';for(let g of groups){let b=document.createElement('button');b.className='tab'+(g===selectedGroup?' active':'');b.textContent=g;b.onclick=()=>{selectedGroup=g;render(window._last)};tabs.appendChild(b);}}"
+        "function render(j){window._last=j;document.getElementById('meta').textContent=`hosts=${j.hosts} up=${j.up} down=${j.down} unk=${j.unk}`;drawTabs(j.list);"
+        "let tb=document.getElementById('tb');tb.innerHTML='';let arr=j.list.filter(h=>(h.group||'Default')===selectedGroup);arr.sort((a,b)=>(a.subgroup||'').localeCompare(b.subgroup||'')||a.id-b.id);let cur='';"
+        "for(let h of arr){if(h.subgroup!==cur){cur=h.subgroup;let sh=document.createElement('tr');sh.className='subhead';sh.innerHTML=`<td colspan=10>${selectedGroup} / ${cur||'Main'}</td>`;tb.appendChild(sh);}"
+        "let cls=h.st=='UP'?'up':(h.st=='DOWN'?'down':'unk');let tr=document.createElement('tr');tr.id='r'+h.id;tr.innerHTML=`<td>${h.id}</td><td><input name=group value='${h.group}'></td><td><input name=subgroup value='${h.subgroup}'></td><td><a href='/host?id=${h.id}'>${h.name}</a><br><small>${h.ip||''}</small></td>`+`<td class='${cls}'>${h.st}</td><td><input name=interval_ms type=number min=50 value='${h.interval_ms}' style='width:90px'></td><td><input name=timeout_ms type=number min=50 value='${h.timeout_ms}' style='width:90px'></td>`+`<td><input name=down_threshold type=number min=1 value='${h.down_threshold}' style='width:70px'></td><td>${h.fail||0}</td><td><select name=enabled><option value=1 ${h.enabled?'selected':''}>on</option><option value=0 ${!h.enabled?'selected':''}>off</option></select><button onclick='editHost(${h.id})'>Save</button></td>`;tb.appendChild(tr);}"
+        "}"
         "async function go(force=false){if(isEditing()&&!force)return;let r=await fetch('/api/hosts');let j=await r.json();render(j);}"
         "async function addHost(ev){ev.preventDefault();let r=await fetch('/api/host/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:enc(ev.target)});document.getElementById('addmsg').textContent=await r.text();go(true);}"
-        "async function editHost(id){let row=document.getElementById('r'+id);let q=new URLSearchParams();['group','subgroup','name','interval_ms','timeout_ms','down_threshold','enabled'].forEach(k=>q.append(k,row.querySelector('[name='+k+']').value));let r=await fetch('/api/host/edit?id='+id,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:q.toString()});alert(await r.text());go(true);}"
+        "async function editHost(id){let row=document.getElementById('r'+id);let q=new URLSearchParams();['group','subgroup','interval_ms','timeout_ms','down_threshold','enabled'].forEach(k=>q.append(k,row.querySelector('[name='+k+']').value));let r=await fetch('/api/host/edit?id='+id,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:q.toString()});alert(await r.text());go(true);}"
         "async function importCsv(){let f=document.getElementById('f').files[0];if(!f)return;let txt=await f.text();let r=await fetch('/api/import.csv',{method:'POST',headers:{'Content-Type':'text/csv'},body:txt});document.getElementById('impmsg').textContent=await r.text();go(true);}"
-        "document.getElementById('addf').onsubmit=addHost;go(true);setInterval(()=>go(false),1000);"
+        "document.getElementById('addf').onsubmit=addHost;go(true);setInterval(()=>go(false),1200);"
         "</script></body></html>";
     http_reply(c, "text/html; charset=utf-8", html);
 }
@@ -746,6 +745,75 @@ static void serve_edit_host(SOCKET c, int id, char* body){
     http_reply(c,"text/plain; charset=utf-8","OK");
 }
 
+
+static void serve_host_page(SOCKET c, int id){
+    if(id<1 || id>g_hosts_cap || !g_hosts[id-1].used){ http_err(c,404,"not found"); return; }
+    const char* html =
+        "<!doctype html><html><head><meta charset=utf-8><title>host</title>"
+        "<style>body{font-family:system-ui;margin:16px}.row{display:flex;gap:14px}.left{width:340px;border:1px solid #ddd;border-radius:10px;padding:10px}.right{flex:1;border:1px solid #ddd;border-radius:10px;padding:10px}canvas{width:100%;height:420px;border:1px solid #ddd}#tip{position:fixed;display:none;background:#111;color:#fff;padding:6px 8px;border-radius:6px;font-size:12px;pointer-events:none}</style></head><body>"
+        "<a href='/'>← back</a><h2 id=t></h2><div class=row><div class=left id=left></div><div class=right><div>RTT points (blue) / loss (red). Наведи на точку.</div><canvas id=cv width=1200 height=420></canvas></div></div><div id=tip></div>"
+        "<script>"
+        "const id=new URLSearchParams(location.search).get('id');let pts=[];"
+        "function fmt(ts){return new Date(ts*1000).toLocaleString()}"
+        "function draw(j){let cv=document.getElementById('cv');let g=cv.getContext('2d');g.clearRect(0,0,cv.width,cv.height);let d=j.samples||[];pts=[];if(d.length<1)return;let p=40,W=cv.width,H=cv.height;let max=1;for(let x of d){if(x.rtt>=0&&x.rtt>max)max=x.rtt;}"
+        "g.strokeStyle='#ddd';g.beginPath();g.moveTo(p,H-p);g.lineTo(W-p,H-p);g.lineTo(W-p,p);g.stroke();"
+        "let xstep=(W-2*p)/(Math.max(1,d.length-1));"
+        "let prev=null;for(let i=0;i<d.length;i++){let x=p+i*xstep;let y=(d[i].rtt<0)?H-p:H-p-(d[i].rtt/max)*(H-2*p);pts.push({x,y,ts:d[i].ts,rtt:d[i].rtt,st:d[i].rtt<0?'LOSS':'UP'});if(d[i].rtt>=0){g.fillStyle='#0b65d8';g.beginPath();g.arc(x,y,2.4,0,Math.PI*2);g.fill();if(prev){g.strokeStyle='#0b65d8';g.beginPath();g.moveTo(prev.x,prev.y);g.lineTo(x,y);g.stroke();}prev={x,y};}else{g.strokeStyle='#c21807';g.beginPath();g.moveTo(x-3,p+2);g.lineTo(x+3,H-p-2);g.stroke();}}"
+        "}"
+        "function bindTip(){let cv=document.getElementById('cv'),tip=document.getElementById('tip');cv.onmousemove=(e)=>{if(!pts.length)return;let r=cv.getBoundingClientRect();let x=(e.clientX-r.left)*(cv.width/r.width);let y=(e.clientY-r.top)*(cv.height/r.height);let best=null,bd=1e9;for(let p of pts){let d=(p.x-x)*(p.x-x)+(p.y-y)*(p.y-y);if(d<bd){bd=d;best=p;}}if(!best||bd>220) {tip.style.display='none';return;}tip.style.display='block';tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY+14)+'px';tip.innerHTML=`${fmt(best.ts)}<br>Status: ${best.st}<br>RTT: ${best.rtt<0?'loss':best.rtt+' ms'}`;};cv.onmouseleave=()=>tip.style.display='none';}"
+        "async function go(){let r=await fetch('/api/host?id='+id);let j=await r.json();document.getElementById('t').textContent=`#${j.id} ${j.name} (${j.ip})`;document.getElementById('left').innerHTML=`<b>Group/Subgroup:</b> ${j.group} / ${j.subgroup}<br><b>Status:</b> ${j.st}<br><b>OK:</b> ${j.ok} <b>Fail(loss):</b> ${j.fail}<br><b>Last:</b> ${j.last} ms<br><b>Avg:</b> ${j.avg} ms<br><b>Min/Max:</b> ${j.min}/${j.max} ms<br><b>Samples(all period):</b> ${j.samples_count}`;draw(j);}"
+        "bindTip();go();setInterval(go,2000);"
+        "</script></body></html>";
+    http_reply(c, "text/html; charset=utf-8", html);
+}
+
+static void serve_api_host(SOCKET c, int id){
+    if(id<1 || id>g_hosts_cap || !g_hosts[id-1].used){ http_err(c,404,"not found"); return; }
+    Host* h = &g_hosts[id-1];
+    LONG ok=h->ok, fail=h->fail, last=h->last_rtt;
+    LONG minr=h->min_rtt; if((u32)minr==0x7fffffffU) minr=0;
+    LONG maxr=h->max_rtt;
+    LONG samp=h->samples; LONGLONG sum=h->sum_rtt;
+    u32 avg=(samp>0)?(u32)(sum/(u64)samp):0;
+    struct in_addr ia; ia.S_un.S_addr = h->ip;
+    char ipbuf[32]; _snprintf_s(ipbuf,sizeof(ipbuf),_TRUNCATE,"%s",inet_ntoa(ia));
+
+    int n=0, cap=2048;
+    int* ts=(int*)malloc(sizeof(int)*cap);
+    int* rr=(int*)malloc(sizeof(int)*cap);
+    if(!ts||!rr){ if(ts)free(ts); if(rr)free(rr); http_err(c,500,"oom"); return; }
+
+    sqlite3* db=NULL; sqlite3_stmt* st=NULL;
+    if(sqlite3_open(g_db_path,&db)==SQLITE_OK){
+        sqlite3_prepare_v2(db, "SELECT ts,rtt_ms FROM samples WHERE host_id=? ORDER BY ts", -1, &st, NULL);
+        sqlite3_bind_int(st,1,id);
+        while(sqlite3_step(st)==SQLITE_ROW){
+            if(n>=cap){ cap*=2; ts=(int*)realloc(ts,sizeof(int)*cap); rr=(int*)realloc(rr,sizeof(int)*cap); if(!ts||!rr) break; }
+            ts[n]=sqlite3_column_int(st,0);
+            rr[n]=(sqlite3_column_type(st,1)==SQLITE_NULL)?-1:sqlite3_column_int(st,1);
+            n++;
+            if(n>200000) break;
+        }
+    }
+    if(st) sqlite3_finalize(st);
+    if(db) sqlite3_close(db);
+
+    size_t bcap = 8192u + (size_t)n*40u;
+    char* buf=(char*)malloc(bcap);
+    if(!buf){ free(ts); free(rr); http_err(c,500,"oom"); return; }
+    size_t len=0;
+    len += _snprintf_s(buf+len,bcap-len,_TRUNCATE,
+        "{\"id\":%d,\"name\":\"%s\",\"ip\":\"%s\",\"group\":\"%s\",\"subgroup\":\"%s\",\"st\":\"%s\",\"ok\":%ld,\"fail\":%ld,\"last\":%ld,\"avg\":%u,\"min\":%ld,\"max\":%ld,\"samples_count\":%d,\"samples\":[",
+        id,h->name,ipbuf,h->group,h->subgroup,st_name(h->st),ok,fail,last,avg,minr,maxr,n);
+    for(int i=0;i<n;i++){
+        len += _snprintf_s(buf+len,bcap-len,_TRUNCATE,"%s{\"ts\":%d,\"rtt\":%d}", (i?",":""), ts[i], rr[i]);
+        if(len > bcap-128) break;
+    }
+    len += _snprintf_s(buf+len,bcap-len,_TRUNCATE,"]}");
+    http_reply_raw(c, "application/json; charset=utf-8", buf, (int)strlen(buf));
+    free(buf); free(ts); free(rr);
+}
+
 static DWORD WINAPI http_thread(void* _){
     (void)_;
     SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -774,7 +842,9 @@ static DWORD WINAPI http_thread(void* _){
             if(!sp){ http_err(c,400,"bad"); }
             else{ *sp=0;
                 if(strcmp(p,"/")==0) serve_index(c);
+                else if(starts_with(p,"/host")) serve_host_page(c, parse_qs_id(p));
                 else if(strcmp(p,"/api/hosts")==0) serve_api_hosts(c);
+                else if(starts_with(p,"/api/host")) serve_api_host(c, parse_qs_id(p));
                 else if(strcmp(p,"/api/export.csv")==0) serve_export_csv(c);
                 else http_err(c,404,"not found");
             }
