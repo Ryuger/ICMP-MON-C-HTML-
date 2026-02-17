@@ -51,6 +51,7 @@ typedef struct Host {
     u32 hist_cap, hist_pos, hist_count;
 
     volatile LONG sched_gen;
+    volatile LONG queued;
 } Host;
 
 typedef struct SchedNode {
@@ -289,18 +290,40 @@ static SchedNode heap_pop(void){
     return t;
 }
 
-typedef struct Task { SLIST_ENTRY e; int host_id; } Task;
-static SLIST_HEADER g_q;
+typedef struct Task { int host_id; } Task;
+static Task* g_task_q = NULL;
+static LONG g_q_cap = 0;
+static LONG g_q_head = 0;
+static LONG g_q_tail = 0;
+static LONG g_q_count = 0;
+static SRWLOCK g_q_lock;
 static HANDLE g_sem = NULL;
 
-static void q_post(int host_id){
-    Task* t = (Task*)_aligned_malloc(sizeof(Task), MEMORY_ALLOCATION_ALIGNMENT);
-    if(!t) return;
-    t->host_id = host_id;
-    InterlockedPushEntrySList(&g_q, &t->e);
-    ReleaseSemaphore(g_sem, 1, NULL);
+static int q_post(int host_id){
+    int ok = 0;
+    AcquireSRWLockExclusive(&g_q_lock);
+    if(g_q_count < g_q_cap){
+        g_task_q[g_q_tail].host_id = host_id;
+        g_q_tail = (g_q_tail + 1) % g_q_cap;
+        g_q_count++;
+        ok = 1;
+    }
+    ReleaseSRWLockExclusive(&g_q_lock);
+    if(ok) ReleaseSemaphore(g_sem, 1, NULL);
+    return ok;
 }
-static Task* q_take(void){ WaitForSingleObject(g_sem, INFINITE); return (Task*)InterlockedPopEntrySList(&g_q); }
+static int q_take(void){
+    int id = 0;
+    WaitForSingleObject(g_sem, INFINITE);
+    AcquireSRWLockExclusive(&g_q_lock);
+    if(g_q_count > 0){
+        id = g_task_q[g_q_head].host_id;
+        g_q_head = (g_q_head + 1) % g_q_cap;
+        g_q_count--;
+    }
+    ReleaseSRWLockExclusive(&g_q_lock);
+    return id;
+}
 
 /* DB */
 typedef enum { DB_SAMPLE=1, DB_EVENT=2, DB_STOP=3 } DbType;
@@ -434,14 +457,12 @@ static void update_minmax(Host* h, u32 rtt){
 static DWORD WINAPI worker(void* _){
     (void)_;
     for(;;){
-        Task* t = q_take();
-        if(!t) continue;
-        if(t->host_id <= 0){ _aligned_free(t); break; }
-        int id = t->host_id;
-        _aligned_free(t);
+        int id = q_take();
+        if(id <= 0) break;
 
         if(id < 1 || id > g_hosts_cap) continue;
         Host* h = &g_hosts[id-1];
+        InterlockedExchange(&h->queued, 0);
         if(!h->used || !h->enabled) continue;
 
         ULONG ip = h->ip;
@@ -561,31 +582,29 @@ static void serve_index(SOCKET c){
     const char* html =
         "<!doctype html><html><head><meta charset=utf-8><title>icmpmon</title>"
         "<style>body{font-family:system-ui;margin:16px}table{border-collapse:collapse;width:100%}th,td{border-bottom:1px solid #ddd;padding:6px;font-size:13px}"
-        ".up{color:green}.down{color:#b00020}.unk{color:#666}.card{border:1px solid #ddd;padding:10px;border-radius:10px;margin-bottom:12px}</style></head><body>"
-        "<h2>icmpmon: groups/subgroups + host editor</h2><div id=meta></div>"
+        ".up{color:green}.down{color:#b00020}.unk{color:#666}.card{border:1px solid #ddd;padding:10px;border-radius:10px;margin-bottom:12px}input,select{font-size:12px}</style></head><body>"
+        "<h2>icmpmon</h2><div id=meta></div>"
         "<div class=card><h3>Add host</h3><form id=addf>"
         "Group <input name=group value='Default'> Subgroup <input name=subgroup value='Main'> Host/IP <input name=name required> "
         "Interval ms <input name=interval_ms type=number value=1000 min=50> Timeout ms <input name=timeout_ms type=number value=1000 min=50>"
         " <button>Add</button></form><div id=addmsg></div></div>"
+        "<div class=card><h3>Excel (CSV)</h3><button onclick='location.href=\"/api/export.csv\"'>Export CSV</button> <input id=f type=file accept='.csv'> <button onclick='importCsv()'>Import CSV</button> <span id=impmsg></span></div>"
         "<table><thead><tr><th>ID</th><th>Group</th><th>Subgroup</th><th>Host</th><th>Status</th><th>Interval</th><th>Timeout</th><th>DownThr</th><th>Actions</th></tr></thead><tbody id=tb></tbody></table>"
         "<script>"
+        "let lastData=[];"
         "function enc(f){return new URLSearchParams(new FormData(f)).toString()}"
-        "async function addHost(ev){ev.preventDefault();let r=await fetch('/api/host/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:enc(ev.target)});"
-        "document.getElementById('addmsg').textContent=await r.text();go();}"
-        "document.getElementById('addf').onsubmit=addHost;"
-        "async function editHost(id){"
-        " let row=document.getElementById('r'+id);"
-        " let q=new URLSearchParams();['group','subgroup','name','interval_ms','timeout_ms','down_threshold','enabled'].forEach(k=>q.append(k,row.querySelector('[name='+k+']').value));"
-        " let r=await fetch('/api/host/edit?id='+id,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:q.toString()});"
-        " alert(await r.text()); go();"
-        "}"
-        "async function go(){let r=await fetch('/api/hosts');let j=await r.json();document.getElementById('meta').textContent=`hosts=${j.hosts} up=${j.up} down=${j.down} unk=${j.unk}`;"
+        "function isEditing(){let a=document.activeElement;return !!(a && (a.tagName=='INPUT'||a.tagName=='SELECT'||a.tagName=='TEXTAREA'));}"
+        "function render(j){document.getElementById('meta').textContent=`hosts=${j.hosts} up=${j.up} down=${j.down} unk=${j.unk}`;lastData=j.list;"
         "let tb=document.getElementById('tb');tb.innerHTML='';for(let h of j.list){let cls=h.st=='UP'?'up':(h.st=='DOWN'?'down':'unk');"
         "let tr=document.createElement('tr');tr.id='r'+h.id;tr.innerHTML=`<td>${h.id}</td><td><input name=group value='${h.group}'></td><td><input name=subgroup value='${h.subgroup}'></td><td><input name=name value='${h.name}'></td>`+"
         "`<td class='${cls}'>${h.st}</td><td><input name=interval_ms type=number min=50 value='${h.interval_ms}' style='width:90px'></td><td><input name=timeout_ms type=number min=50 value='${h.timeout_ms}' style='width:90px'></td>`+"
         "`<td><input name=down_threshold type=number min=1 value='${h.down_threshold}' style='width:70px'></td><td><select name=enabled><option value=1 ${h.enabled?'selected':''}>on</option><option value=0 ${!h.enabled?'selected':''}>off</option></select><button onclick='editHost(${h.id})'>Save</button></td>`;"
         "tb.appendChild(tr);} }"
-        "go();setInterval(go,1000);"
+        "async function go(force=false){if(isEditing()&&!force)return;let r=await fetch('/api/hosts');let j=await r.json();render(j);}"
+        "async function addHost(ev){ev.preventDefault();let r=await fetch('/api/host/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:enc(ev.target)});document.getElementById('addmsg').textContent=await r.text();go(true);}"
+        "async function editHost(id){let row=document.getElementById('r'+id);let q=new URLSearchParams();['group','subgroup','name','interval_ms','timeout_ms','down_threshold','enabled'].forEach(k=>q.append(k,row.querySelector('[name='+k+']').value));let r=await fetch('/api/host/edit?id='+id,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:q.toString()});alert(await r.text());go(true);}"
+        "async function importCsv(){let f=document.getElementById('f').files[0];if(!f)return;let txt=await f.text();let r=await fetch('/api/import.csv',{method:'POST',headers:{'Content-Type':'text/csv'},body:txt});document.getElementById('impmsg').textContent=await r.text();go(true);}"
+        "document.getElementById('addf').onsubmit=addHost;go(true);setInterval(()=>go(false),1000);"
         "</script></body></html>";
     http_reply(c, "text/html; charset=utf-8", html);
 }
@@ -615,6 +634,67 @@ static void serve_api_hosts(SOCKET c){
     free(buf);
 }
 
+static void serve_export_csv(SOCKET c){
+    size_t cap = 1024 + (size_t)(g_n_hosts+4) * 256;
+    char* buf = (char*)malloc(cap);
+    if(!buf){ http_err(c,500,"oom"); return; }
+    int len = _snprintf_s(buf, cap, _TRUNCATE, "group,subgroup,host,interval_ms,timeout_ms,down_threshold,enabled\r\n");
+    AcquireSRWLockShared(&g_hosts_lock);
+    for(int i=0;i<g_hosts_cap;i++){
+        Host* h=&g_hosts[i];
+        if(!h->used) continue;
+        len += _snprintf_s(buf+len, cap-len, _TRUNCATE, "\"%s\",\"%s\",\"%s\",%ld,%ld,%ld,%d\r\n", h->group, h->subgroup, h->name, h->interval_ms, h->timeout_ms, h->down_threshold, h->enabled);
+        if(len > (int)cap-512) break;
+    }
+    ReleaseSRWLockShared(&g_hosts_lock);
+    http_reply_raw(c, "text/csv; charset=utf-8", buf, (int)strlen(buf));
+    free(buf);
+}
+
+static void strip_quotes(char* s){
+    size_t n = strlen(s);
+    if(n>=2 && s[0]=='"' && s[n-1]=='"'){ memmove(s, s+1, n-2); s[n-2]=0; }
+}
+
+static void serve_import_csv(SOCKET c, char* body){
+    int added = 0;
+    char* save = NULL;
+    char* line = strtok_s(body, "\r\n", &save);
+    while(line){
+        char* t = trim_a(line);
+        if(*t && strncmp(t, "group,subgroup,host", 19)!=0){
+            char* parts[7] = {0};
+            int n=0;
+            char* save2=NULL;
+            char* tok = strtok_s(t, ",", &save2);
+            while(tok && n<7){ parts[n++] = trim_a(tok); tok = strtok_s(NULL, ",", &save2); }
+            if(n>=3){
+                for(int i=0;i<n;i++) strip_quotes(parts[i]);
+                ULONG ip;
+                if(resolve_v4(parts[2], &ip)){
+                    u32 iv = (n>3)?(u32)strtoul(parts[3],0,10):g_default_interval_ms;
+                    u32 to = (n>4)?(u32)strtoul(parts[4],0,10):g_default_timeout_ms;
+                    u32 dt = (n>5)?(u32)strtoul(parts[5],0,10):g_default_down_threshold;
+                    int en = (n>6)?atoi(parts[6]):1;
+                    int id = add_host(parts[2], parts[0], parts[1], ip, iv, to, dt);
+                    if(id>0){
+                        if(!en) edit_host(id,NULL,NULL,NULL,NULL,0,0,0,0,0,0,1,0);
+                        AcquireSRWLockExclusive(&g_sched_lock);
+                        SchedNode sn; sn.host_id=id; sn.gen=g_hosts[id-1].sched_gen; sn.due_qpc=qpc_now();
+                        heap_push(sn);
+                        ReleaseSRWLockExclusive(&g_sched_lock);
+                        added++;
+                    }
+                }
+            }
+        }
+        line = strtok_s(NULL, "\r\n", &save);
+    }
+    db_sync_hosts();
+    char msg[64]; _snprintf_s(msg,sizeof(msg),_TRUNCATE,"imported=%d",added);
+    http_reply(c,"text/plain; charset=utf-8",msg);
+}
+
 static void serve_add_host(SOCKET c, char* body){
     char name[64]={0}, group[64]={0}, subgroup[64]={0}, tmp[32];
     if(!form_get(body,"name",name,sizeof(name)) || !*name){ http_err(c,400,"name required"); return; }
@@ -629,7 +709,7 @@ static void serve_add_host(SOCKET c, char* body){
     if(id<=0){ http_err(c,500,"add failed"); return; }
 
     AcquireSRWLockExclusive(&g_sched_lock);
-    SchedNode n; n.host_id=id; n.gen=g_hosts[id-1].sched_gen; n.due_qpc=qpc_now()+ms_to_qpc((u32)g_hosts[id-1].interval_ms);
+    SchedNode n; n.host_id=id; n.gen=g_hosts[id-1].sched_gen; n.due_qpc=qpc_now();
     heap_push(n);
     ReleaseSRWLockExclusive(&g_sched_lock);
 
@@ -657,7 +737,7 @@ static void serve_edit_host(SOCKET c, int id, char* body){
     if(set_interval || set_enabled){
         AcquireSRWLockExclusive(&g_sched_lock);
         Host* h=&g_hosts[id-1];
-        SchedNode n; n.host_id=id; n.gen=h->sched_gen; n.due_qpc=qpc_now()+ms_to_qpc((u32)h->interval_ms);
+        SchedNode n; n.host_id=id; n.gen=h->sched_gen; n.due_qpc=qpc_now();
         heap_push(n);
         ReleaseSRWLockExclusive(&g_sched_lock);
     }
@@ -695,6 +775,7 @@ static DWORD WINAPI http_thread(void* _){
             else{ *sp=0;
                 if(strcmp(p,"/")==0) serve_index(c);
                 else if(strcmp(p,"/api/hosts")==0) serve_api_hosts(c);
+                else if(strcmp(p,"/api/export.csv")==0) serve_export_csv(c);
                 else http_err(c,404,"not found");
             }
         }else if(starts_with(req,"POST ")){
@@ -710,6 +791,7 @@ static DWORD WINAPI http_thread(void* _){
                 }
                 if(strcmp(p,"/api/host/add")==0) serve_add_host(c, body);
                 else if(starts_with(p,"/api/host/edit")) serve_edit_host(c, parse_qs_id(p), body);
+                else if(strcmp(p,"/api/import.csv")==0) serve_import_csv(c, body);
                 else http_err(c,404,"not found");
             }
         }else http_err(c,405,"method");
@@ -723,12 +805,8 @@ int main(int argc, char** argv){
     setvbuf(stdout,NULL,_IONBF,0);
     setvbuf(stderr,NULL,_IONBF,0);
 
-    if(argc < 3){
-        fprintf(stderr, "usage: %s hosts.txt interval_ms [threads=64] [timeout_ms=1000] [down_threshold=3] [history_len=512] [http_port=8080] [console_fps=1] [db_path=icmpmon.db]\n", argv[0]);
-        return 2;
-    }
-
-    g_default_interval_ms = (u32)strtoul(argv[2],0,10);
+    const char* hosts_path = (argc>1) ? argv[1] : "-";
+    g_default_interval_ms = (argc>2) ? (u32)strtoul(argv[2],0,10) : 1000;
     int threads = (argc>3)?atoi(argv[3]):64;
     g_default_timeout_ms = (argc>4)?(u32)strtoul(argv[4],0,10):1000;
     g_default_down_threshold = (argc>5)?(u32)strtoul(argv[5],0,10):3;
@@ -756,14 +834,18 @@ int main(int argc, char** argv){
     if(!g_hosts || !g_heap) return 1;
     for(int i=0;i<g_hosts_cap;i++) host_init_slot(&g_hosts[i]);
 
-    int loaded = load_hosts_file(argv[1]);
-    if(loaded <= 0){ fprintf(stderr,"No hosts loaded\n"); return 1; }
+    int loaded = 0;
+    if(strcmp(hosts_path, "-") != 0) loaded = load_hosts_file(hosts_path);
+    if(loaded < 0){ fprintf(stderr,"hosts load failed\n"); return 1; }
     fprintf(stderr,"loaded hosts: %d\n", loaded);
 
     g_icmp = IcmpCreateFile();
     if(g_icmp == INVALID_HANDLE_VALUE) return 1;
 
-    InitializeSListHead(&g_q);
+    InitializeSRWLock(&g_q_lock);
+    g_q_cap = g_hosts_cap * 8;
+    g_task_q = (Task*)calloc((size_t)g_q_cap, sizeof(Task));
+    if(!g_task_q){ fprintf(stderr, "task queue alloc failed\n"); return 1; }
     g_sem = CreateSemaphoreW(NULL,0,0x7fffffff,NULL);
     InitializeSListHead(&g_dbq);
     g_dbsem = CreateSemaphoreW(NULL,0,0x7fffffff,NULL);
@@ -773,6 +855,13 @@ int main(int argc, char** argv){
     HANDLE hdb = CreateThread(NULL,0,db_thread,NULL,0,NULL);
     (void)hdb;
 
+    int target_sweep_ms = 3000;
+    LONG nh = g_n_hosts;
+    int need_threads = (nh>0) ? (int)(((u64)nh * (u64)g_default_timeout_ms + target_sweep_ms - 1) / target_sweep_ms) : 1;
+    if(need_threads < threads) need_threads = threads;
+    if(need_threads > 1024) need_threads = 1024;
+    threads = need_threads;
+    fprintf(stderr, "workers: %d (auto-adjusted)\n", threads);
     for(int i=0;i<threads;i++) CreateThread(NULL,0,worker,NULL,0,NULL);
     CreateThread(NULL,0,http_thread,NULL,0,NULL);
 
@@ -782,9 +871,7 @@ int main(int argc, char** argv){
     u64 now = qpc_now();
     AcquireSRWLockExclusive(&g_sched_lock);
     for(int i=0;i<g_hosts_cap;i++) if(g_hosts[i].used){
-        u32 iv = (u32)g_hosts[i].interval_ms;
-        u64 phase = ms_to_qpc((u32)((i*31u)%iv));
-        SchedNode n; n.host_id=i+1; n.gen=g_hosts[i].sched_gen; n.due_qpc=now + phase;
+        SchedNode n; n.host_id=i+1; n.gen=g_hosts[i].sched_gen; n.due_qpc=now;
         heap_push(n);
     }
     ReleaseSRWLockExclusive(&g_sched_lock);
@@ -815,7 +902,9 @@ int main(int argc, char** argv){
             Host* h = &g_hosts[sn.host_id-1];
             if(!h->used || sn.gen != h->sched_gen || !h->enabled) continue;
 
-            q_post(sn.host_id);
+            if(InterlockedCompareExchange(&h->queued, 1, 0) == 0){
+                if(!q_post(sn.host_id)) InterlockedExchange(&h->queued, 0);
+            }
 
             u64 step = ms_to_qpc((u32)h->interval_ms);
             u64 next_due = sn.due_qpc + step;
