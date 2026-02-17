@@ -98,6 +98,19 @@ static void sleep_until_qpc(u64 due){
 
 static int is_space_a(char c){ return c==' '||c=='\t'||c=='\r'||c=='\n'; }
 
+static char* trim_a(char* s){
+    char* e;
+    while(*s && is_space_a(*s)) s++;
+    if(!*s) return s;
+    e = s + strlen(s) - 1;
+    while(e >= s && is_space_a(*e)){
+        *e = 0;
+        if(e == s) break;
+        e--;
+    }
+    return s;
+}
+
 static int resolve_v4(const char* s, ULONG* out_ip){
     struct addrinfo hints, *ai = 0;
     ZeroMemory(&hints, sizeof(hints));
@@ -141,8 +154,7 @@ static void host_init_slot(Host* h){
 }
 
 static int parse_host_line(char* line, char* group, char* subgroup, char* name, u32* interval_ms){
-    char* p = line;
-    while(*p && is_space_a(*p)) p++;
+    char* p = trim_a(line);
     if(!*p || *p=='#') return 0;
 
     char* tok[4] = {0};
@@ -156,7 +168,10 @@ static int parse_host_line(char* line, char* group, char* subgroup, char* name, 
         p++;
     }
 
+    for(int i=0;i<n;i++) tok[i] = trim_a(tok[i]);
+
     if(n == 1){
+        if(!*tok[0]) return 0;
         _snprintf_s(group, 64, _TRUNCATE, "Default");
         _snprintf_s(subgroup, 64, _TRUNCATE, "Main");
         _snprintf_s(name, 64, _TRUNCATE, "%s", tok[0]);
@@ -164,6 +179,7 @@ static int parse_host_line(char* line, char* group, char* subgroup, char* name, 
         return 1;
     }
     if(n >= 3){
+        if(!*tok[2]) return 0;
         _snprintf_s(group, 64, _TRUNCATE, "%s", tok[0]);
         _snprintf_s(subgroup, 64, _TRUNCATE, "%s", tok[1]);
         _snprintf_s(name, 64, _TRUNCATE, "%s", tok[2]);
