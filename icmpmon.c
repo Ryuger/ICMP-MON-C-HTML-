@@ -819,7 +819,7 @@ static void serve_host_page(SOCKET c, int id){
         "</div><canvas id=cv width=1400 height=460></canvas></div></div><div id=tip></div>"
         "<script>"
         "const id=new URLSearchParams(location.search).get('id');"
-        "let all=[];let view={live:true,start:0,end:0};let drag=null;let holdUpdates=false;let yMaxFixed=100;let formDirty=false;"
+        "let all=[];let view={live:true,start:0,end:0};let drag=null;let holdUpdates=false;let yMaxFixed=100;let formDirty=false;let formLocked=false;"
         "function fmt(ts){return new Date(ts*1000).toLocaleString()}"
         "function lossGapSec(intervalMs){let x=Math.ceil((intervalMs||1000)*2/1000);return x<1?1:x;}"
         "function computeFixedY(data){let m=1;for(let i=0;i<data.length;i++){if(data[i].rtt>=0&&data[i].rtt>m)m=data[i].rtt;}m=Math.ceil(m*1.15);if(m<50)m=50;return m;}"
@@ -867,9 +867,9 @@ static void serve_host_page(SOCKET c, int id){
         "document.getElementById('resetBtn').onclick=()=>{setLive(true);go();};"
         "}"
 
-        "function fillEdit(j){if(formDirty) return;let f=document.getElementById('ef');f.group.value=j.group;f.subgroup.value=j.subgroup;f.interval_ms.value=j.interval_ms;f.timeout_ms.value=j.timeout_ms;f.down_threshold.value=j.down_threshold;f.enabled.value=j.enabled?1:0;}"
-        "async function go(){let r=await fetch('/api/host?id='+id);let j=await r.json();window._lastJ=j;document.getElementById('t').textContent=`#${j.id} ${j.name} (${j.ip})`;document.getElementById('left').innerHTML=`<b>Group/Subgroup:</b> ${j.group} / ${j.subgroup}<br><b>Status:</b> ${j.st}<br><b>OK:</b> ${j.ok} <b>Fail(loss):</b> ${j.fail}<br><b>Last:</b> ${j.last} ms<br><b>Avg:</b> ${j.avg} ms<br><b>Min/Max:</b> ${j.min}/${j.max} ms<br><b>Samples(all period):</b> ${j.samples_count}`;if(!view.start||view.live){let sec=Number(document.getElementById('range').value);let end=(j.samples&&j.samples.length)?j.samples[j.samples.length-1].ts:Math.floor(Date.now()/1000);let start=(sec===0||!j.samples||!j.samples.length)?(j.samples&&j.samples.length?j.samples[0].ts:end-300):Math.max(j.samples[0].ts,end-sec);view.start=start;view.end=end;}fillEdit(j);draw(j);}"
-        "document.getElementById('ef').oninput=()=>{formDirty=true;};document.getElementById('ef').onsubmit=async (e)=>{e.preventDefault();let q=new URLSearchParams(new FormData(e.target)).toString();let r=await fetch('/api/host/edit?id='+id,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:q});document.getElementById('emsg').textContent=await r.text();formDirty=false;go();};"
+        "function fillEdit(j){if(formLocked||formDirty) return;let f=document.getElementById('ef');f.group.value=j.group;f.subgroup.value=j.subgroup;f.interval_ms.value=j.interval_ms;f.timeout_ms.value=j.timeout_ms;f.down_threshold.value=j.down_threshold;f.enabled.value=j.enabled?1:0;}"
+        "async function go(){let r=await fetch('/api/host?id='+id);let j=await r.json();window._lastJ=j;if(!formLocked){document.getElementById('t').textContent=`#${j.id} ${j.name} (${j.ip})`;document.getElementById('left').innerHTML=`<b>Group/Subgroup:</b> ${j.group} / ${j.subgroup}<br><b>Status:</b> ${j.st}<br><b>OK:</b> ${j.ok} <b>Fail(loss):</b> ${j.fail}<br><b>Last:</b> ${j.last} ms<br><b>Avg:</b> ${j.avg} ms<br><b>Min/Max:</b> ${j.min}/${j.max} ms<br><b>Samples(all period):</b> ${j.samples_count}`;}if(!view.start||view.live){let sec=Number(document.getElementById('range').value);let end=(j.samples&&j.samples.length)?j.samples[j.samples.length-1].ts:Math.floor(Date.now()/1000);let start=(sec===0||!j.samples||!j.samples.length)?(j.samples&&j.samples.length?j.samples[0].ts:end-300):Math.max(j.samples[0].ts,end-sec);view.start=start;view.end=end;}fillEdit(j);draw(j);}"
+        "document.getElementById('ef').onfocusin=()=>{formLocked=true;};document.getElementById('ef').oninput=()=>{formDirty=true;formLocked=true;};document.getElementById('ef').onsubmit=async (e)=>{e.preventDefault();let q=new URLSearchParams(new FormData(e.target)).toString();let r=await fetch('/api/host/edit?id='+id,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:q});document.getElementById('emsg').textContent=await r.text();formDirty=false;formLocked=false;go();};"
         "bindCanvas();bindToolbar();go();setInterval(()=>{if(view.live && !holdUpdates) go();},2000);"
         "</script></body></html>";
     http_reply(c, "text/html; charset=utf-8", html);
@@ -1067,7 +1067,7 @@ int main(int argc, char** argv){
         sleep_until_qpc(wake);
 
         now = qpc_now();
-        if(now >= next_render){ render_console(); do{ next_render += render_step; }while(next_render <= now); }
+        if(now >= next_render){ do{ next_render += render_step; }while(next_render <= now); }
 
         for(;;){
             SchedNode sn;
