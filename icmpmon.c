@@ -642,7 +642,7 @@ static void serve_index(SOCKET c){
         "Group <input name=group value='Default'> Subgroup <input name=subgroup value='Main'> Host/IP <input name=name required> "
         "Interval (ms) <input name=interval_ms type=number value=1000 min=50> Timeout (ms) <input name=timeout_ms type=number value=1000 min=50>"
         " <button>Add</button></form><div id=addmsg></div></div>"
-        "<div class=card><h3>Excel (CSV)</h3><button onclick='location.href=\"/api/export.csv\"'>Export CSV</button> <input id=f type=file accept='.csv'> <button onclick='importCsv()'>Import CSV</button> <span id=impmsg></span></div>"
+        "<div class=card><h3>Excel (CSV)</h3><button onclick='location.href=\"/api/export.csv\"'>Export CSV</button> <input id=f type=file accept='.csv'> <button onclick='previewCsv()'>Подробнее</button> <button onclick='importCsv()'>Import CSV</button> <span id=impmsg></span><pre id=impdetail style='white-space:pre-wrap;max-height:220px;overflow:auto;background:#f8f8f8;padding:8px'></pre></div>"
         "<table><thead><tr><th>ID</th><th>Group</th><th>Subgroup</th><th>Host/IP</th><th>Status</th><th>Interval (ms)</th><th>Timeout (ms)</th><th>DownThr (fails)</th><th>Loss</th><th>Details</th></tr></thead><tbody id=tb></tbody></table>"
         "<script>"
         "let selectedGroup='';"
@@ -655,6 +655,7 @@ static void serve_index(SOCKET c){
         "}"
         "async function go(){let r=await fetch('/api/hosts');let j=await r.json();render(j);}"
         "async function addHost(ev){ev.preventDefault();let r=await fetch('/api/host/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:enc(ev.target)});document.getElementById('addmsg').textContent=await r.text();go();}"
+        "async function previewCsv(){let f=document.getElementById('f').files[0];if(!f)return;let txt=await f.text();let r=await fetch('/api/import/preview.csv',{method:'POST',headers:{'Content-Type':'text/csv'},body:txt});let j=await r.json();document.getElementById('impmsg').textContent=`can_import=${j.preview_can_import} bad=${j.bad} dup_existing=${j.duplicates_existing} dup_file=${j.duplicates_file}`;let lines=(j.details||[]).map(d=>`line ${d.line}: ${d.host||'(empty)'} -> ${d.reason}`);document.getElementById('impdetail').textContent=lines.length?lines.join('\n'):'No conflicts';}"
         "async function importCsv(){let f=document.getElementById('f').files[0];if(!f)return;let txt=await f.text();let r=await fetch('/api/import.csv',{method:'POST',headers:{'Content-Type':'text/csv'},body:txt});document.getElementById('impmsg').textContent=await r.text();go();}"
         "document.getElementById('addf').onsubmit=addHost;go();setInterval(go,1500);"
         "</script></body></html>";
@@ -752,12 +753,50 @@ static int split_csv_line(char* line, char delim, char** out, int max_out){
     return n;
 }
 
-static void serve_import_csv(SOCKET c, char* body){
-    int added = 0;
-    int bad = 0;
+
+static int host_exists_name_or_ip(const char* name, ULONG ip){
+    int found = 0;
+    AcquireSRWLockShared(&g_hosts_lock);
+    for(int i=0;i<g_hosts_cap;i++){
+        Host* h = &g_hosts[i];
+        if(!h->used) continue;
+        if(ip != 0 && h->ip == ip){ found = 1; break; }
+        if(name && *name && _stricmp(h->name, name) == 0){ found = 1; break; }
+    }
+    ReleaseSRWLockShared(&g_hosts_lock);
+    return found;
+}
+
+static int in_batch_duplicate(const char* name, ULONG ip, ULONG* ips, char names[][64], int n){
+    for(int i=0;i<n;i++){
+        if(ip != 0 && ips[i] == ip) return 1;
+        if(name && *name && _stricmp(names[i], name) == 0) return 1;
+    }
+    return 0;
+}
+
+static void append_detail_json(char* out, size_t cap, size_t* len, int line_no, const char* host, const char* reason, int* details_count){
+    if(*details_count >= 200) return;
+    *len += _snprintf_s(out+*len, cap-*len, _TRUNCATE,
+        "%s{\"line\":%d,\"host\":\"%s\",\"reason\":\"%s\"}",
+        (*details_count?",":""), line_no, host?host:"", reason?reason:"");
+    (*details_count)++;
+}
+
+static void process_csv_rows(char* body, int preview_only, int* out_added, int* out_bad, int* out_dup_exist, int* out_dup_file, char* details, size_t details_cap, int* out_details_count){
+    int added=0,bad=0,dup_exist=0,dup_file=0;
+    size_t dlen = 0;
+    int details_count = 0;
+    int line_no = 0;
+
+    ULONG* seen_ips = (ULONG*)calloc(g_hosts_cap, sizeof(ULONG));
+    char (*seen_names)[64] = (char(*)[64])calloc(g_hosts_cap, sizeof(*seen_names));
+    int seen_n = 0;
+
     char* save = NULL;
     char* line = strtok_s(body, "\r\n", &save);
     while(line){
+        line_no++;
         char* t = strip_utf8_bom(trim_a(line));
         if(*t){
             if(starts_with(t, "group,") || starts_with(t, "group;") || starts_with(t, "GROUP,") || starts_with(t, "GROUP;")){
@@ -773,27 +812,92 @@ static void serve_import_csv(SOCKET c, char* body){
             if(n>=3 && parts[2] && *parts[2]){
                 ULONG ip;
                 if(resolve_v4(parts[2], &ip)){
-                    u32 iv = (n>3)?(u32)strtoul(parts[3],0,10):g_default_interval_ms;
-                    u32 to = (n>4)?(u32)strtoul(parts[4],0,10):g_default_timeout_ms;
-                    u32 dt = (n>5)?(u32)strtoul(parts[5],0,10):g_default_down_threshold;
-                    int en = (n>6)?atoi(parts[6]):1;
-                    int id = add_host(parts[2], (n>0)?parts[0]:"Default", (n>1)?parts[1]:"Main", ip, iv, to, dt);
-                    if(id>0){
-                        if(!en) edit_host(id,NULL,NULL,NULL,NULL,0,0,0,0,0,0,1,0);
-                        AcquireSRWLockExclusive(&g_sched_lock);
-                        SchedNode sn; sn.host_id=id; sn.gen=g_hosts[id-1].sched_gen; sn.due_qpc=qpc_now();
-                        heap_push(sn);
-                        ReleaseSRWLockExclusive(&g_sched_lock);
+                    if(host_exists_name_or_ip(parts[2], ip)){
+                        dup_exist++;
+                        append_detail_json(details, details_cap, &dlen, line_no, parts[2], "already exists", &details_count);
+                    }else if(in_batch_duplicate(parts[2], ip, seen_ips, seen_names, seen_n)){
+                        dup_file++;
+                        append_detail_json(details, details_cap, &dlen, line_no, parts[2], "duplicate inside file", &details_count);
+                    }else if(!preview_only){
+                        u32 iv = (n>3)?(u32)strtoul(parts[3],0,10):g_default_interval_ms;
+                        u32 to = (n>4)?(u32)strtoul(parts[4],0,10):g_default_timeout_ms;
+                        u32 dt = (n>5)?(u32)strtoul(parts[5],0,10):g_default_down_threshold;
+                        int en = (n>6)?atoi(parts[6]):1;
+                        int id = add_host(parts[2], (n>0)?parts[0]:"Default", (n>1)?parts[1]:"Main", ip, iv, to, dt);
+                        if(id>0){
+                            if(!en) edit_host(id,NULL,NULL,NULL,NULL,0,0,0,0,0,0,1,0);
+                            AcquireSRWLockExclusive(&g_sched_lock);
+                            SchedNode sn; sn.host_id=id; sn.gen=g_hosts[id-1].sched_gen; sn.due_qpc=qpc_now();
+                            heap_push(sn);
+                            ReleaseSRWLockExclusive(&g_sched_lock);
+                            if(seen_n < g_hosts_cap){
+                                seen_ips[seen_n] = ip;
+                                _snprintf_s(seen_names[seen_n], 64, _TRUNCATE, "%s", parts[2]);
+                                seen_n++;
+                            }
+                            added++;
+                        }else{
+                            bad++;
+                            append_detail_json(details, details_cap, &dlen, line_no, parts[2], "cannot add (capacity?)", &details_count);
+                        }
+                    }else{
+                        if(seen_n < g_hosts_cap){
+                            seen_ips[seen_n] = ip;
+                            _snprintf_s(seen_names[seen_n], 64, _TRUNCATE, "%s", parts[2]);
+                            seen_n++;
+                        }
                         added++;
-                    }else bad++;
-                }else bad++;
-            }else bad++;
+                    }
+                }else{
+                    bad++;
+                    append_detail_json(details, details_cap, &dlen, line_no, parts[2], "resolve failed", &details_count);
+                }
+            }else{
+                bad++;
+                append_detail_json(details, details_cap, &dlen, line_no, "", "invalid columns", &details_count);
+            }
         }
         line = strtok_s(NULL, "\r\n", &save);
     }
+
+    if(seen_ips) free(seen_ips);
+    if(seen_names) free(seen_names);
+
+    *out_added = added;
+    *out_bad = bad;
+    *out_dup_exist = dup_exist;
+    *out_dup_file = dup_file;
+    *out_details_count = details_count;
+}
+
+static void serve_import_preview_csv(SOCKET c, char* body){
+    int add=0,bad=0,dup_exist=0,dup_file=0,details_count=0;
+    char* details = (char*)calloc(1, 65536);
+    if(!details){ http_err(c,500,"oom"); return; }
+    process_csv_rows(body, 1, &add, &bad, &dup_exist, &dup_file, details, 65536, &details_count);
+
+    char* out = (char*)calloc(1, 131072);
+    if(!out){ free(details); http_err(c,500,"oom"); return; }
+    _snprintf_s(out, 131072, _TRUNCATE,
+        "{\"preview_can_import\":%d,\"bad\":%d,\"duplicates_existing\":%d,\"duplicates_file\":%d,\"details\":[%s]}",
+        add, bad, dup_exist, dup_file, details);
+    http_reply_raw(c, "application/json; charset=utf-8", out, (int)strlen(out));
+    free(out);
+    free(details);
+}
+
+static void serve_import_csv(SOCKET c, char* body){
+    int added = 0, bad = 0, dup_exist = 0, dup_file = 0, details_count = 0;
+    char* details = (char*)calloc(1, 65536);
+    if(!details){ http_err(c,500,"oom"); return; }
+
+    process_csv_rows(body, 0, &added, &bad, &dup_exist, &dup_file, details, 65536, &details_count);
     db_sync_hosts();
-    char msg[96]; _snprintf_s(msg,sizeof(msg),_TRUNCATE,"imported=%d bad=%d",added,bad);
+
+    char msg[160];
+    _snprintf_s(msg,sizeof(msg),_TRUNCATE,"imported=%d bad=%d dup_existing=%d dup_file=%d",added,bad,dup_exist,dup_file);
     http_reply(c,"text/plain; charset=utf-8",msg);
+    free(details);
 }
 
 static void serve_add_host(SOCKET c, char* body){
@@ -1019,6 +1123,7 @@ static DWORD WINAPI http_thread(void* _){
                 if(strcmp(p,"/api/host/add")==0) serve_add_host(c, body);
                 else if(starts_with(p,"/api/host/edit")) serve_edit_host(c, parse_qs_id(p), body);
                 else if(strcmp(p,"/api/import.csv")==0) serve_import_csv(c, body);
+                else if(strcmp(p,"/api/import/preview.csv")==0) serve_import_preview_csv(c, body);
                 else http_err(c,404,"not found");
             }
         }else http_err(c,405,"method");
