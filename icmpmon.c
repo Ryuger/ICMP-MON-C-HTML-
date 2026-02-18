@@ -708,27 +708,76 @@ static void strip_quotes(char* s){
     if(n>=2 && s[0]=='"' && s[n-1]=='"'){ memmove(s, s+1, n-2); s[n-2]=0; }
 }
 
+static char* strip_utf8_bom(char* s){
+    unsigned char* u = (unsigned char*)s;
+    if(u[0]==0xEF && u[1]==0xBB && u[2]==0xBF) return s+3;
+    return s;
+}
+
+static int split_csv_line(char* line, char delim, char** out, int max_out){
+    int n = 0;
+    char* p = line;
+    while(*p && n < max_out){
+        while(*p && is_space_a(*p)) p++;
+        if(!*p) break;
+
+        if(*p == '"'){
+            p++;
+            out[n++] = p;
+            while(*p){
+                if(*p == '"' && p[1] == '"'){
+                    memmove(p, p+1, strlen(p));
+                    p++;
+                    continue;
+                }
+                if(*p == '"'){
+                    *p = 0;
+                    p++;
+                    break;
+                }
+                p++;
+            }
+            while(*p && *p != delim) p++;
+            if(*p == delim){ *p = 0; p++; }
+        }else{
+            out[n++] = p;
+            while(*p && *p != delim) p++;
+            if(*p == delim){ *p = 0; p++; }
+        }
+    }
+    for(int i=0;i<n;i++){
+        out[i] = trim_a(out[i]);
+        strip_quotes(out[i]);
+    }
+    return n;
+}
+
 static void serve_import_csv(SOCKET c, char* body){
     int added = 0;
+    int bad = 0;
     char* save = NULL;
     char* line = strtok_s(body, "\r\n", &save);
     while(line){
-        char* t = trim_a(line);
-        if(*t && strncmp(t, "group,subgroup,host", 19)!=0){
-            char* parts[7] = {0};
-            int n=0;
-            char* save2=NULL;
-            char* tok = strtok_s(t, ",", &save2);
-            while(tok && n<7){ parts[n++] = trim_a(tok); tok = strtok_s(NULL, ",", &save2); }
-            if(n>=3){
-                for(int i=0;i<n;i++) strip_quotes(parts[i]);
+        char* t = strip_utf8_bom(trim_a(line));
+        if(*t){
+            if(starts_with(t, "group,") || starts_with(t, "group;") || starts_with(t, "GROUP,") || starts_with(t, "GROUP;")){
+                line = strtok_s(NULL, "\r\n", &save);
+                continue;
+            }
+
+            char delim = ',';
+            if(strchr(t, ';') && !strchr(t, ',')) delim = ';';
+
+            char* parts[8] = {0};
+            int n = split_csv_line(t, delim, parts, 8);
+            if(n>=3 && parts[2] && *parts[2]){
                 ULONG ip;
                 if(resolve_v4(parts[2], &ip)){
                     u32 iv = (n>3)?(u32)strtoul(parts[3],0,10):g_default_interval_ms;
                     u32 to = (n>4)?(u32)strtoul(parts[4],0,10):g_default_timeout_ms;
                     u32 dt = (n>5)?(u32)strtoul(parts[5],0,10):g_default_down_threshold;
                     int en = (n>6)?atoi(parts[6]):1;
-                    int id = add_host(parts[2], parts[0], parts[1], ip, iv, to, dt);
+                    int id = add_host(parts[2], (n>0)?parts[0]:"Default", (n>1)?parts[1]:"Main", ip, iv, to, dt);
                     if(id>0){
                         if(!en) edit_host(id,NULL,NULL,NULL,NULL,0,0,0,0,0,0,1,0);
                         AcquireSRWLockExclusive(&g_sched_lock);
@@ -736,14 +785,14 @@ static void serve_import_csv(SOCKET c, char* body){
                         heap_push(sn);
                         ReleaseSRWLockExclusive(&g_sched_lock);
                         added++;
-                    }
-                }
-            }
+                    }else bad++;
+                }else bad++;
+            }else bad++;
         }
         line = strtok_s(NULL, "\r\n", &save);
     }
     db_sync_hosts();
-    char msg[64]; _snprintf_s(msg,sizeof(msg),_TRUNCATE,"imported=%d",added);
+    char msg[96]; _snprintf_s(msg,sizeof(msg),_TRUNCATE,"imported=%d bad=%d",added,bad);
     http_reply(c,"text/plain; charset=utf-8",msg);
 }
 
