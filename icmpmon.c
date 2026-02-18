@@ -395,6 +395,58 @@ static void db_sync_hosts(void){
     sqlite3_close(db);
 }
 
+static int db_load_hosts(void){
+    sqlite3* db = NULL;
+    sqlite3_stmt* st = NULL;
+    int n = 0;
+    if(sqlite3_open(g_db_path, &db) != SQLITE_OK){ if(db) sqlite3_close(db); return 0; }
+    if(sqlite3_prepare_v2(db, "SELECT host_id,name,ip,grp,subgrp,interval_ms,timeout_ms,down_threshold,enabled FROM hosts ORDER BY host_id", -1, &st, NULL) != SQLITE_OK){ sqlite3_close(db); return 0; }
+
+    AcquireSRWLockExclusive(&g_hosts_lock);
+    while(sqlite3_step(st) == SQLITE_ROW){
+        int id = sqlite3_column_int(st, 0);
+        const unsigned char* name = sqlite3_column_text(st, 1);
+        const unsigned char* iptxt = sqlite3_column_text(st, 2);
+        const unsigned char* grp = sqlite3_column_text(st, 3);
+        const unsigned char* sub = sqlite3_column_text(st, 4);
+        int interval_ms = sqlite3_column_int(st, 5);
+        int timeout_ms = sqlite3_column_int(st, 6);
+        int down_thr = sqlite3_column_int(st, 7);
+        int enabled = sqlite3_column_int(st, 8);
+
+        if(id < 1 || id > g_hosts_cap) continue;
+        Host* h = &g_hosts[id-1];
+        ULONG ip = 0;
+        if(iptxt && *iptxt){
+            struct in_addr ia;
+            if(InetPtonA(AF_INET, (const char*)iptxt, &ia) == 1) ip = ia.S_un.S_addr;
+        }
+        if(ip == 0){
+            if(!resolve_v4((const char*)(name ? name : (const unsigned char*)""), &ip)) continue;
+        }
+
+        h->used = 1;
+        h->enabled = enabled ? 1 : 0;
+        h->ip = ip;
+        _snprintf_s(h->name, sizeof(h->name), _TRUNCATE, "%s", name ? (const char*)name : "host");
+        _snprintf_s(h->group, sizeof(h->group), _TRUNCATE, "%s", grp ? (const char*)grp : "Default");
+        _snprintf_s(h->subgroup, sizeof(h->subgroup), _TRUNCATE, "%s", sub ? (const char*)sub : "Main");
+        h->interval_ms = (LONG)(interval_ms < 50 ? 50 : interval_ms);
+        h->timeout_ms = (LONG)(timeout_ms < 50 ? 50 : timeout_ms);
+        h->down_threshold = (LONG)(down_thr < 1 ? 1 : down_thr);
+        h->sched_gen = 1;
+        h->queued = 0;
+        host_reset_stats(h);
+        InterlockedIncrement(&g_n_hosts);
+        n++;
+    }
+    ReleaseSRWLockExclusive(&g_hosts_lock);
+
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return n;
+}
+
 static DWORD WINAPI db_thread(void* _){
     (void)_;
     sqlite3* db = NULL;
@@ -767,7 +819,7 @@ static void serve_host_page(SOCKET c, int id){
         "</div><canvas id=cv width=1400 height=460></canvas></div></div><div id=tip></div>"
         "<script>"
         "const id=new URLSearchParams(location.search).get('id');"
-        "let all=[];let view={live:true,start:0,end:0};let drag=null;let holdUpdates=false;let yMaxFixed=100;"
+        "let all=[];let view={live:true,start:0,end:0};let drag=null;let holdUpdates=false;let yMaxFixed=100;let formDirty=false;"
         "function fmt(ts){return new Date(ts*1000).toLocaleString()}"
         "function lossGapSec(intervalMs){let x=Math.ceil((intervalMs||1000)*2/1000);return x<1?1:x;}"
         "function computeFixedY(data){let m=1;for(let i=0;i<data.length;i++){if(data[i].rtt>=0&&data[i].rtt>m)m=data[i].rtt;}m=Math.ceil(m*1.15);if(m<50)m=50;return m;}"
@@ -801,7 +853,7 @@ static void serve_host_page(SOCKET c, int id){
         "cv.onmouseleave=()=>{tip.style.display='none';holdUpdates=false;};"
         "cv.onmousedown=(e)=>{setLive(false);drag={x:e.clientX,start:view.start,end:view.end};};window.onmouseup=()=>drag=null;"
         "window.onmousemove=(e)=>{if(drag){let dx=e.clientX-drag.x;let span=Math.max(1,drag.end-drag.start);let dt=Math.round(-dx*(span/Math.max(1,cv.clientWidth)));view.start=drag.start+dt;view.end=drag.end+dt;draw(window._lastJ||{samples:all,interval_ms:1000});return;}"
-        "let pts=window._pts||[];if(!pts.length)return;let r=cv.getBoundingClientRect();let x=(e.clientX-r.left)*(cv.width/r.width),y=(e.clientY-r.top)*(cv.height/r.height);let best=null,bd=1e9;for(let i=0;i<pts.length;i++){let p=pts[i],d=(p.x-x)*(p.x-x)+(p.y-y)*(p.y-y);if(d<bd){bd=d;best=p;}}if(!best||bd>250){tip.style.display='none';return;}tip.style.display='block';tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY+14)+'px';tip.innerHTML=`${fmt(best.ts)}<br>Status: ${best.st}<br>RTT: ${best.rtt<0?'loss':best.rtt+' ms'}`;};"
+        "let pts=window._pts||[];if(!pts.length)return;let r=cv.getBoundingClientRect();let x=(e.clientX-r.left)*(cv.width/r.width),y=(e.clientY-r.top)*(cv.height/r.height);let best=null,bd=1e9;for(let i=0;i<pts.length;i++){let p=pts[i],d=(p.x-x)*(p.x-x)+(p.y-y)*(p.y-y);if(d<bd){bd=d;best=p;}}if(!best||bd>250){tip.style.display='none';return;}tip.style.display='block';tip.innerHTML=`${fmt(best.ts)}<br>Status: ${best.st}<br>RTT: ${best.rtt<0?'loss':best.rtt+' ms'}`;let tw=tip.offsetWidth||140,th=tip.offsetHeight||70;let lx=e.clientX+14,ly=e.clientY+14;let maxX=window.innerWidth-tw-8,maxY=window.innerHeight-th-8;if(lx>maxX)lx=maxX;if(ly>maxY)ly=maxY;if(lx<8)lx=8;if(ly<8)ly=8;tip.style.left=lx+'px';tip.style.top=ly+'px';};"
         "cv.onwheel=(e)=>{e.preventDefault();setLive(false);let k=e.deltaY>0?1.2:0.82;let mid=(view.start+view.end)/2;let span=Math.max(2,(view.end-view.start)*k);view.start=Math.round(mid-span/2);view.end=Math.round(mid+span/2);draw(window._lastJ||{samples:all,interval_ms:1000});};"
         "}"
 
@@ -815,9 +867,9 @@ static void serve_host_page(SOCKET c, int id){
         "document.getElementById('resetBtn').onclick=()=>{setLive(true);go();};"
         "}"
 
-        "function fillEdit(j){let f=document.getElementById('ef');f.group.value=j.group;f.subgroup.value=j.subgroup;f.interval_ms.value=j.interval_ms;f.timeout_ms.value=j.timeout_ms;f.down_threshold.value=j.down_threshold;f.enabled.value=j.enabled?1:0;}"
+        "function fillEdit(j){if(formDirty) return;let f=document.getElementById('ef');f.group.value=j.group;f.subgroup.value=j.subgroup;f.interval_ms.value=j.interval_ms;f.timeout_ms.value=j.timeout_ms;f.down_threshold.value=j.down_threshold;f.enabled.value=j.enabled?1:0;}"
         "async function go(){let r=await fetch('/api/host?id='+id);let j=await r.json();window._lastJ=j;document.getElementById('t').textContent=`#${j.id} ${j.name} (${j.ip})`;document.getElementById('left').innerHTML=`<b>Group/Subgroup:</b> ${j.group} / ${j.subgroup}<br><b>Status:</b> ${j.st}<br><b>OK:</b> ${j.ok} <b>Fail(loss):</b> ${j.fail}<br><b>Last:</b> ${j.last} ms<br><b>Avg:</b> ${j.avg} ms<br><b>Min/Max:</b> ${j.min}/${j.max} ms<br><b>Samples(all period):</b> ${j.samples_count}`;if(!view.start||view.live){let sec=Number(document.getElementById('range').value);let end=(j.samples&&j.samples.length)?j.samples[j.samples.length-1].ts:Math.floor(Date.now()/1000);let start=(sec===0||!j.samples||!j.samples.length)?(j.samples&&j.samples.length?j.samples[0].ts:end-300):Math.max(j.samples[0].ts,end-sec);view.start=start;view.end=end;}fillEdit(j);draw(j);}"
-        "document.getElementById('ef').onsubmit=async (e)=>{e.preventDefault();let q=new URLSearchParams(new FormData(e.target)).toString();let r=await fetch('/api/host/edit?id='+id,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:q});document.getElementById('emsg').textContent=await r.text();go();};"
+        "document.getElementById('ef').oninput=()=>{formDirty=true;};document.getElementById('ef').onsubmit=async (e)=>{e.preventDefault();let q=new URLSearchParams(new FormData(e.target)).toString();let r=await fetch('/api/host/edit?id='+id,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:q});document.getElementById('emsg').textContent=await r.text();formDirty=false;go();};"
         "bindCanvas();bindToolbar();go();setInterval(()=>{if(view.live && !holdUpdates) go();},2000);"
         "</script></body></html>";
     http_reply(c, "text/html; charset=utf-8", html);
@@ -931,15 +983,17 @@ int main(int argc, char** argv){
     setvbuf(stdout,NULL,_IONBF,0);
     setvbuf(stderr,NULL,_IONBF,0);
 
-    const char* hosts_path = (argc>1) ? argv[1] : "-";
-    g_default_interval_ms = (argc>2) ? (u32)strtoul(argv[2],0,10) : 1000;
-    int threads = (argc>3)?atoi(argv[3]):64;
-    g_default_timeout_ms = (argc>4)?(u32)strtoul(argv[4],0,10):1000;
-    g_default_down_threshold = (argc>5)?(u32)strtoul(argv[5],0,10):3;
-    g_history_len = (argc>6)?(u32)strtoul(argv[6],0,10):512;
-    g_http_port = (argc>7)?(u32)strtoul(argv[7],0,10):8080;
-    u32 console_fps = (argc>8)?(u32)strtoul(argv[8],0,10):1;
-    g_db_path = (argc>9)?argv[9]:"icmpmon.db";
+    int argi = 1;
+    if(argc > 1 && (argv[1][0]<'0' || argv[1][0]>'9')) argi = 2; /* backward compatible: ignore hosts.txt arg */
+
+    g_default_interval_ms = (argc>argi) ? (u32)strtoul(argv[argi],0,10) : 1000;
+    int threads = (argc>argi+1)?atoi(argv[argi+1]):64;
+    g_default_timeout_ms = (argc>argi+2)?(u32)strtoul(argv[argi+2],0,10):1000;
+    g_default_down_threshold = (argc>argi+3)?(u32)strtoul(argv[argi+3],0,10):3;
+    g_history_len = (argc>argi+4)?(u32)strtoul(argv[argi+4],0,10):512;
+    g_http_port = (argc>argi+5)?(u32)strtoul(argv[argi+5],0,10):8080;
+    u32 console_fps = (argc>argi+6)?(u32)strtoul(argv[argi+6],0,10):1;
+    g_db_path = (argc>argi+7)?argv[argi+7]:"icmpmon.db";
 
     if(g_default_interval_ms < 50) g_default_interval_ms = 50;
     if(g_default_timeout_ms < 50) g_default_timeout_ms = 50;
@@ -961,9 +1015,6 @@ int main(int argc, char** argv){
     for(int i=0;i<g_hosts_cap;i++) host_init_slot(&g_hosts[i]);
 
     int loaded = 0;
-    if(strcmp(hosts_path, "-") != 0) loaded = load_hosts_file(hosts_path);
-    if(loaded < 0){ fprintf(stderr,"hosts load failed\n"); return 1; }
-    fprintf(stderr,"loaded hosts: %d\n", loaded);
 
     g_icmp = IcmpCreateFile();
     if(g_icmp == INVALID_HANDLE_VALUE) return 1;
@@ -977,6 +1028,8 @@ int main(int argc, char** argv){
     g_dbsem = CreateSemaphoreW(NULL,0,0x7fffffff,NULL);
 
     db_init();
+    loaded = db_load_hosts();
+    fprintf(stderr,"loaded hosts from db: %d\n", loaded);
     db_sync_hosts();
     HANDLE hdb = CreateThread(NULL,0,db_thread,NULL,0,NULL);
     (void)hdb;
