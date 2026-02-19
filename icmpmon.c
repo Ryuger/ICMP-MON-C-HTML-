@@ -344,10 +344,11 @@ static HANDLE g_dbsem = NULL;
 static void db_post(DbMsg* m){ InterlockedPushEntrySList(&g_dbq, &m->e); ReleaseSemaphore(g_dbsem, 1, NULL); }
 static DbMsg* db_take(void){ WaitForSingleObject(g_dbsem, INFINITE); return (DbMsg*)InterlockedPopEntrySList(&g_dbq); }
 
-static void db_exec(sqlite3* db, const char* sql){
+static int db_exec(sqlite3* db, const char* sql){
     char* err = NULL;
     int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
     if(rc != SQLITE_OK){ fprintf(stderr, "SQLite exec error: %s\n", err ? err : "(null)"); sqlite3_free(err); }
+    return rc;
 }
 
 static void db_init(void){
@@ -366,9 +367,15 @@ static void db_sync_hosts(void){
     sqlite3* db = NULL;
     sqlite3_stmt* st = NULL;
     if(sqlite3_open(g_db_path, &db) != SQLITE_OK){ if(db) sqlite3_close(db); return; }
-    db_exec(db, "BEGIN;");
-    sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO hosts(host_id,name,ip,grp,subgrp,interval_ms,timeout_ms,down_threshold,enabled) VALUES(?,?,?,?,?,?,?,?,?)", -1, &st, NULL);
+    sqlite3_busy_timeout(db, 3000);
+    if(db_exec(db, "BEGIN;") != SQLITE_OK){ sqlite3_close(db); return; }
+    if(sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO hosts(host_id,name,ip,grp,subgrp,interval_ms,timeout_ms,down_threshold,enabled) VALUES(?,?,?,?,?,?,?,?,?)", -1, &st, NULL) != SQLITE_OK){
+        db_exec(db, "ROLLBACK;");
+        sqlite3_close(db);
+        return;
+    }
 
+    int ok = 1;
     AcquireSRWLockShared(&g_hosts_lock);
     for(int i=0;i<g_hosts_cap;i++){
         Host* h = &g_hosts[i];
@@ -377,6 +384,7 @@ static void db_sync_hosts(void){
         struct in_addr ia; ia.S_un.S_addr = h->ip;
         _snprintf_s(ipbuf, sizeof(ipbuf), _TRUNCATE, "%s", inet_ntoa(ia));
         sqlite3_reset(st);
+        sqlite3_clear_bindings(st);
         sqlite3_bind_int(st, 1, i+1);
         sqlite3_bind_text(st, 2, h->name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 3, ipbuf, -1, SQLITE_TRANSIENT);
@@ -386,12 +394,13 @@ static void db_sync_hosts(void){
         sqlite3_bind_int(st, 7, h->timeout_ms);
         sqlite3_bind_int(st, 8, h->down_threshold);
         sqlite3_bind_int(st, 9, h->enabled);
-        sqlite3_step(st);
+        if(sqlite3_step(st) != SQLITE_DONE){ ok = 0; break; }
     }
     ReleaseSRWLockShared(&g_hosts_lock);
 
-    db_exec(db, "COMMIT;");
     sqlite3_finalize(st);
+    if(ok) db_exec(db, "COMMIT;");
+    else db_exec(db, "ROLLBACK;");
     sqlite3_close(db);
 }
 
@@ -452,36 +461,57 @@ static DWORD WINAPI db_thread(void* _){
     sqlite3* db = NULL;
     sqlite3_stmt* st_sample = NULL;
     sqlite3_stmt* st_event = NULL;
+    int tx_open = 0;
     if(sqlite3_open(g_db_path, &db) != SQLITE_OK){ InterlockedExchange(&g_db_enabled, 0); if(db) sqlite3_close(db); return 0; }
-    sqlite3_prepare_v2(db, "INSERT INTO samples(ts,host_id,rtt_ms,timeout_ms) VALUES(?,?,?,?)", -1, &st_sample, NULL);
-    sqlite3_prepare_v2(db, "INSERT INTO events(ts,host_id,old_status,new_status,detail) VALUES(?,?,?,?,?)", -1, &st_event, NULL);
-    db_exec(db, "BEGIN;");
+    sqlite3_busy_timeout(db, 3000);
+    if(sqlite3_prepare_v2(db, "INSERT INTO samples(ts,host_id,rtt_ms,timeout_ms) VALUES(?,?,?,?)", -1, &st_sample, NULL) != SQLITE_OK ||
+       sqlite3_prepare_v2(db, "INSERT INTO events(ts,host_id,old_status,new_status,detail) VALUES(?,?,?,?,?)", -1, &st_event, NULL) != SQLITE_OK){
+        if(st_sample) sqlite3_finalize(st_sample);
+        if(st_event) sqlite3_finalize(st_event);
+        sqlite3_close(db);
+        InterlockedExchange(&g_db_enabled, 0);
+        return 0;
+    }
+    if(db_exec(db, "BEGIN;") == SQLITE_OK) tx_open = 1;
     int batch = 0;
     for(;;){
         DbMsg* m = db_take();
         if(!m) continue;
         if(m->type == DB_STOP){ free(m); break; }
+        if(!tx_open && db_exec(db, "BEGIN;") == SQLITE_OK) tx_open = 1;
         if(m->type == DB_SAMPLE){
             sqlite3_reset(st_sample);
+            sqlite3_clear_bindings(st_sample);
             sqlite3_bind_int(st_sample,1,m->ts);
             sqlite3_bind_int(st_sample,2,m->host_id);
             if(m->rtt_ms>=0) sqlite3_bind_int(st_sample,3,m->rtt_ms); else sqlite3_bind_null(st_sample,3);
             sqlite3_bind_int(st_sample,4,m->timeout_ms);
             sqlite3_step(st_sample);
+            sqlite3_reset(st_sample);
         }else if(m->type == DB_EVENT){
             sqlite3_reset(st_event);
+            sqlite3_clear_bindings(st_event);
             sqlite3_bind_int(st_event,1,m->ts);
             sqlite3_bind_int(st_event,2,m->host_id);
             sqlite3_bind_int(st_event,3,m->old_st);
             sqlite3_bind_int(st_event,4,m->new_st);
             sqlite3_bind_text(st_event,5,m->detail,-1,SQLITE_TRANSIENT);
             sqlite3_step(st_event);
+            sqlite3_reset(st_event);
         }
         free(m);
         batch++;
-        if(batch >= 1000){ db_exec(db, "COMMIT;"); db_exec(db, "BEGIN;"); batch = 0; }
+        if(tx_open && batch >= 1000){
+            if(db_exec(db, "COMMIT;") == SQLITE_OK) tx_open = 0;
+            else { db_exec(db, "ROLLBACK;"); tx_open = 0; }
+            batch = 0;
+        }
     }
-    db_exec(db, "COMMIT;");
+    sqlite3_reset(st_sample);
+    sqlite3_reset(st_event);
+    if(tx_open){
+        if(db_exec(db, "COMMIT;") != SQLITE_OK) db_exec(db, "ROLLBACK;");
+    }
     if(st_sample) sqlite3_finalize(st_sample);
     if(st_event) sqlite3_finalize(st_event);
     sqlite3_close(db);
