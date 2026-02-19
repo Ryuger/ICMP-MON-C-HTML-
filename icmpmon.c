@@ -239,6 +239,21 @@ static int edit_host(int id, const char* name, const char* group, const char* su
     return 1;
 }
 
+static int delete_host(int id){
+    if(id < 1 || id > g_hosts_cap) return 0;
+    AcquireSRWLockExclusive(&g_hosts_lock);
+    Host* h = &g_hosts[id-1];
+    if(!h->used){ ReleaseSRWLockExclusive(&g_hosts_lock); return 0; }
+    h->used = 0;
+    h->enabled = 0;
+    h->queued = 0;
+    InterlockedIncrement(&h->sched_gen);
+    host_reset_stats(h);
+    InterlockedDecrement(&g_n_hosts);
+    ReleaseSRWLockExclusive(&g_hosts_lock);
+    return 1;
+}
+
 static int load_hosts_file(const char* path){
     FILE* f = fopen(path, "rb");
     if(!f){ fprintf(stderr, "hosts: cannot open '%s'\n", path); return -1; }
@@ -344,10 +359,11 @@ static HANDLE g_dbsem = NULL;
 static void db_post(DbMsg* m){ InterlockedPushEntrySList(&g_dbq, &m->e); ReleaseSemaphore(g_dbsem, 1, NULL); }
 static DbMsg* db_take(void){ WaitForSingleObject(g_dbsem, INFINITE); return (DbMsg*)InterlockedPopEntrySList(&g_dbq); }
 
-static void db_exec(sqlite3* db, const char* sql){
+static int db_exec(sqlite3* db, const char* sql){
     char* err = NULL;
     int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
     if(rc != SQLITE_OK){ fprintf(stderr, "SQLite exec error: %s\n", err ? err : "(null)"); sqlite3_free(err); }
+    return rc;
 }
 
 static void db_init(void){
@@ -366,9 +382,15 @@ static void db_sync_hosts(void){
     sqlite3* db = NULL;
     sqlite3_stmt* st = NULL;
     if(sqlite3_open(g_db_path, &db) != SQLITE_OK){ if(db) sqlite3_close(db); return; }
-    db_exec(db, "BEGIN;");
-    sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO hosts(host_id,name,ip,grp,subgrp,interval_ms,timeout_ms,down_threshold,enabled) VALUES(?,?,?,?,?,?,?,?,?)", -1, &st, NULL);
+    sqlite3_busy_timeout(db, 3000);
+    if(db_exec(db, "BEGIN;") != SQLITE_OK){ sqlite3_close(db); return; }
+    if(sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO hosts(host_id,name,ip,grp,subgrp,interval_ms,timeout_ms,down_threshold,enabled) VALUES(?,?,?,?,?,?,?,?,?)", -1, &st, NULL) != SQLITE_OK){
+        db_exec(db, "ROLLBACK;");
+        sqlite3_close(db);
+        return;
+    }
 
+    int ok = 1;
     AcquireSRWLockShared(&g_hosts_lock);
     for(int i=0;i<g_hosts_cap;i++){
         Host* h = &g_hosts[i];
@@ -377,6 +399,7 @@ static void db_sync_hosts(void){
         struct in_addr ia; ia.S_un.S_addr = h->ip;
         _snprintf_s(ipbuf, sizeof(ipbuf), _TRUNCATE, "%s", inet_ntoa(ia));
         sqlite3_reset(st);
+        sqlite3_clear_bindings(st);
         sqlite3_bind_int(st, 1, i+1);
         sqlite3_bind_text(st, 2, h->name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 3, ipbuf, -1, SQLITE_TRANSIENT);
@@ -386,12 +409,51 @@ static void db_sync_hosts(void){
         sqlite3_bind_int(st, 7, h->timeout_ms);
         sqlite3_bind_int(st, 8, h->down_threshold);
         sqlite3_bind_int(st, 9, h->enabled);
-        sqlite3_step(st);
+        if(sqlite3_step(st) != SQLITE_DONE){ ok = 0; break; }
     }
     ReleaseSRWLockShared(&g_hosts_lock);
 
-    db_exec(db, "COMMIT;");
     sqlite3_finalize(st);
+    if(ok) db_exec(db, "COMMIT;");
+    else db_exec(db, "ROLLBACK;");
+    sqlite3_close(db);
+}
+
+static void db_delete_host_data(int id){
+    sqlite3* db = NULL;
+    sqlite3_stmt* st_hosts = NULL;
+    sqlite3_stmt* st_samples = NULL;
+    sqlite3_stmt* st_events = NULL;
+    if(sqlite3_open(g_db_path, &db) != SQLITE_OK){ if(db) sqlite3_close(db); return; }
+    sqlite3_busy_timeout(db, 3000);
+    if(db_exec(db, "BEGIN;") != SQLITE_OK){ sqlite3_close(db); return; }
+    if(sqlite3_prepare_v2(db, "DELETE FROM hosts WHERE host_id=?", -1, &st_hosts, NULL) != SQLITE_OK ||
+       sqlite3_prepare_v2(db, "DELETE FROM samples WHERE host_id=?", -1, &st_samples, NULL) != SQLITE_OK ||
+       sqlite3_prepare_v2(db, "DELETE FROM events WHERE host_id=?", -1, &st_events, NULL) != SQLITE_OK){
+        if(st_hosts) sqlite3_finalize(st_hosts);
+        if(st_samples) sqlite3_finalize(st_samples);
+        if(st_events) sqlite3_finalize(st_events);
+        db_exec(db, "ROLLBACK;");
+        sqlite3_close(db);
+        return;
+    }
+
+    sqlite3_bind_int(st_hosts, 1, id);
+    sqlite3_step(st_hosts);
+    sqlite3_reset(st_hosts);
+
+    sqlite3_bind_int(st_samples, 1, id);
+    sqlite3_step(st_samples);
+    sqlite3_reset(st_samples);
+
+    sqlite3_bind_int(st_events, 1, id);
+    sqlite3_step(st_events);
+    sqlite3_reset(st_events);
+
+    sqlite3_finalize(st_hosts);
+    sqlite3_finalize(st_samples);
+    sqlite3_finalize(st_events);
+    if(db_exec(db, "COMMIT;") != SQLITE_OK) db_exec(db, "ROLLBACK;");
     sqlite3_close(db);
 }
 
@@ -452,36 +514,57 @@ static DWORD WINAPI db_thread(void* _){
     sqlite3* db = NULL;
     sqlite3_stmt* st_sample = NULL;
     sqlite3_stmt* st_event = NULL;
+    int tx_open = 0;
     if(sqlite3_open(g_db_path, &db) != SQLITE_OK){ InterlockedExchange(&g_db_enabled, 0); if(db) sqlite3_close(db); return 0; }
-    sqlite3_prepare_v2(db, "INSERT INTO samples(ts,host_id,rtt_ms,timeout_ms) VALUES(?,?,?,?)", -1, &st_sample, NULL);
-    sqlite3_prepare_v2(db, "INSERT INTO events(ts,host_id,old_status,new_status,detail) VALUES(?,?,?,?,?)", -1, &st_event, NULL);
-    db_exec(db, "BEGIN;");
+    sqlite3_busy_timeout(db, 3000);
+    if(sqlite3_prepare_v2(db, "INSERT INTO samples(ts,host_id,rtt_ms,timeout_ms) VALUES(?,?,?,?)", -1, &st_sample, NULL) != SQLITE_OK ||
+       sqlite3_prepare_v2(db, "INSERT INTO events(ts,host_id,old_status,new_status,detail) VALUES(?,?,?,?,?)", -1, &st_event, NULL) != SQLITE_OK){
+        if(st_sample) sqlite3_finalize(st_sample);
+        if(st_event) sqlite3_finalize(st_event);
+        sqlite3_close(db);
+        InterlockedExchange(&g_db_enabled, 0);
+        return 0;
+    }
+    if(db_exec(db, "BEGIN;") == SQLITE_OK) tx_open = 1;
     int batch = 0;
     for(;;){
         DbMsg* m = db_take();
         if(!m) continue;
         if(m->type == DB_STOP){ free(m); break; }
+        if(!tx_open && db_exec(db, "BEGIN;") == SQLITE_OK) tx_open = 1;
         if(m->type == DB_SAMPLE){
             sqlite3_reset(st_sample);
+            sqlite3_clear_bindings(st_sample);
             sqlite3_bind_int(st_sample,1,m->ts);
             sqlite3_bind_int(st_sample,2,m->host_id);
             if(m->rtt_ms>=0) sqlite3_bind_int(st_sample,3,m->rtt_ms); else sqlite3_bind_null(st_sample,3);
             sqlite3_bind_int(st_sample,4,m->timeout_ms);
             sqlite3_step(st_sample);
+            sqlite3_reset(st_sample);
         }else if(m->type == DB_EVENT){
             sqlite3_reset(st_event);
+            sqlite3_clear_bindings(st_event);
             sqlite3_bind_int(st_event,1,m->ts);
             sqlite3_bind_int(st_event,2,m->host_id);
             sqlite3_bind_int(st_event,3,m->old_st);
             sqlite3_bind_int(st_event,4,m->new_st);
             sqlite3_bind_text(st_event,5,m->detail,-1,SQLITE_TRANSIENT);
             sqlite3_step(st_event);
+            sqlite3_reset(st_event);
         }
         free(m);
         batch++;
-        if(batch >= 1000){ db_exec(db, "COMMIT;"); db_exec(db, "BEGIN;"); batch = 0; }
+        if(tx_open && batch >= 1000){
+            if(db_exec(db, "COMMIT;") == SQLITE_OK) tx_open = 0;
+            else { db_exec(db, "ROLLBACK;"); tx_open = 0; }
+            batch = 0;
+        }
     }
-    db_exec(db, "COMMIT;");
+    sqlite3_reset(st_sample);
+    sqlite3_reset(st_event);
+    if(tx_open){
+        if(db_exec(db, "COMMIT;") != SQLITE_OK) db_exec(db, "ROLLBACK;");
+    }
     if(st_sample) sqlite3_finalize(st_sample);
     if(st_event) sqlite3_finalize(st_event);
     sqlite3_close(db);
@@ -636,7 +719,7 @@ static int form_get(char* body, const char* key, char* out, int out_sz){
 static void serve_index(SOCKET c){
     const char* html =
         "<!doctype html><html><head><meta charset=utf-8><title>icmpmon</title>"
-        "<style>body{font-family:system-ui;margin:16px}.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}.tab{padding:6px 10px;border:1px solid #bbb;border-radius:8px;cursor:pointer;background:#fff}.tab.active{background:#1f6feb;color:#fff;border-color:#1f6feb}.card{border:1px solid #ddd;padding:10px;border-radius:10px;margin-bottom:12px}table{border-collapse:collapse;width:100%}th,td{border-bottom:1px solid #ddd;padding:6px;font-size:13px}.subhead{background:#f7f7f7;font-weight:600}.up{color:green}.down{color:#b00020}.unk{color:#666}</style></head><body>"
+        "<style>body{font-family:system-ui;margin:16px}.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}.tab{padding:6px 10px;border:1px solid #bbb;border-radius:8px;cursor:pointer;background:#fff}.tab.active{background:#1f6feb;color:#fff;border-color:#1f6feb}.card{border:1px solid #ddd;padding:10px;border-radius:10px;margin-bottom:12px}table{border-collapse:collapse;width:100%}th,td{border-bottom:1px solid #ddd;padding:6px;font-size:13px}.subhead{background:#f7f7f7;font-weight:600}.up{color:green}.down{color:#b00020}.unk{color:#666}.act{display:flex;gap:6px;align-items:center}</style></head><body>"
         "<h2>icmpmon</h2><div id=meta></div><div id=tabs class=tabs></div>"
         "<div class=card><h3>Add host</h3><form id=addf>"
         "Group <input name=group value='Default'> Subgroup <input name=subgroup value='Main'> Host/IP <input name=name required> "
@@ -651,11 +734,10 @@ static void serve_index(SOCKET c){
         "function render(j){window._last=j;document.getElementById('meta').textContent=`hosts=${j.hosts} up=${j.up} down=${j.down} unk=${j.unk}`;drawTabs(j.list);"
         "let tb=document.getElementById('tb');tb.innerHTML='';let arr=j.list.filter(h=>(h.group||'Default')===selectedGroup);arr.sort((a,b)=>(a.subgroup||'').localeCompare(b.subgroup||'')||a.id-b.id);let cur='';"
         "for(let h of arr){if(h.subgroup!==cur){cur=h.subgroup;let sh=document.createElement('tr');sh.className='subhead';sh.innerHTML=`<td colspan=10>${selectedGroup} / ${cur||'Main'}</td>`;tb.appendChild(sh);}"
-        "let cls=h.st=='UP'?'up':(h.st=='DOWN'?'down':'unk');let tr=document.createElement('tr');tr.innerHTML=`<td>${h.id}</td><td>${h.group}</td><td>${h.subgroup}</td><td>${h.name}<br><small>${h.ip||''}</small></td><td class='${cls}'>${h.st}</td><td>${h.interval_ms}</td><td>${h.timeout_ms}</td><td>${h.down_threshold}</td><td>${h.fail||0}</td><td><a href='/host?id=${h.id}'>Open</a></td>`;tb.appendChild(tr);}"
+        "let cls=h.st=='UP'?'up':(h.st=='DOWN'?'down':'unk');let hostCell=(h.ip&&h.name&&h.ip!==h.name)?`${h.name}<br><small>${h.ip}</small>`:(h.name||h.ip||'');let tr=document.createElement('tr');tr.innerHTML=`<td>${h.id}</td><td>${h.group}</td><td>${h.subgroup}</td><td>${hostCell}</td><td class='${cls}'>${h.st}</td><td>${h.interval_ms}</td><td>${h.timeout_ms}</td><td>${h.down_threshold}</td><td>${h.fail||0}</td><td><span class='act'><button type='button' onclick='openHost(${h.id})'>Open</button><button type='button' onclick='deleteHost(${h.id})'>Delete</button></span></td>`;tb.appendChild(tr);}"
         "}"
-        "async function go(){let r=await fetch('/api/hosts');let j=await r.json();render(j);}"
-        "async function addHost(ev){ev.preventDefault();let r=await fetch('/api/host/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:enc(ev.target)});document.getElementById('addmsg').textContent=await r.text();go();}"
-        "async function previewCsv(){let f=document.getElementById('f').files[0];if(!f)return;let txt=await f.text();let r=await fetch('/api/import/preview.csv',{method:'POST',headers:{'Content-Type':'text/csv'},body:txt});let j=await r.json();document.getElementById('impmsg').textContent=`can_import=${j.preview_can_import} bad=${j.bad} dup_existing=${j.duplicates_existing} dup_file=${j.duplicates_file}`;let lines=(j.details||[]).map(d=>`line ${d.line}: ${d.host||'(empty)'} -> ${d.reason}`);document.getElementById('impdetail').textContent=lines.length?lines.join('\\n'):'No conflicts';}"
+        "function openHost(id){location.href='/host?id='+id;}async function go(){let r=await fetch('/api/hosts');let j=await r.json();render(j);}"
+        "async function addHost(ev){ev.preventDefault();let r=await fetch('/api/host/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:enc(ev.target)});document.getElementById('addmsg').textContent=await r.text();go();}async function deleteHost(id){let h=(window._last&&window._last.list||[]).find(x=>x.id===id);let q=`${h&&h.group||''}, ${h&&h.subgroup||''}, ${h&&(h.ip||h.name)||''}? удалить или отмена`;if(!confirm(q))return;let r=await fetch('/api/host/delete?id='+id,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:''});document.getElementById('addmsg').textContent=await r.text();go();}async function previewCsv(){let f=document.getElementById('f').files[0];if(!f)return;let txt=await f.text();let r=await fetch('/api/import/preview.csv',{method:'POST',headers:{'Content-Type':'text/csv'},body:txt});let j=await r.json();document.getElementById('impmsg').textContent=`can_import=${j.preview_can_import} bad=${j.bad} dup_existing=${j.duplicates_existing} dup_file=${j.duplicates_file}`;let lines=(j.details||[]).map(d=>`line ${d.line}: ${d.host||'(empty)'} -> ${d.reason}`);document.getElementById('impdetail').textContent=lines.length?lines.join('\\n'):'No conflicts';}"
         "async function importCsv(){let f=document.getElementById('f').files[0];if(!f)return;let txt=await f.text();let r=await fetch('/api/import.csv',{method:'POST',headers:{'Content-Type':'text/csv'},body:txt});document.getElementById('impmsg').textContent=await r.text();go();}"
         "document.getElementById('addf').onsubmit=addHost;go();setInterval(go,1500);"
         "</script></body></html>";
@@ -675,9 +757,12 @@ static void serve_api_hosts(SOCKET c){
     for(int i=0;i<g_hosts_cap;i++){
         Host* h=&g_hosts[i];
         if(!h->used) continue;
+        char ipbuf[32];
+        struct in_addr ia; ia.S_un.S_addr = h->ip;
+        _snprintf_s(ipbuf, sizeof(ipbuf), _TRUNCATE, "%s", inet_ntoa(ia));
         len += _snprintf_s(buf+len, cap-len, _TRUNCATE,
-            "%s{\"id\":%d,\"name\":\"%s\",\"group\":\"%s\",\"subgroup\":\"%s\",\"st\":\"%s\",\"interval_ms\":%ld,\"timeout_ms\":%ld,\"down_threshold\":%ld,\"enabled\":%d}",
-            first?"":",",i+1,h->name,h->group,h->subgroup,st_name(h->st),h->interval_ms,h->timeout_ms,h->down_threshold,h->enabled);
+            "%s{\"id\":%d,\"name\":\"%s\",\"ip\":\"%s\",\"group\":\"%s\",\"subgroup\":\"%s\",\"st\":\"%s\",\"interval_ms\":%ld,\"timeout_ms\":%ld,\"down_threshold\":%ld,\"enabled\":%d,\"fail\":%ld}",
+            first?"":",",i+1,h->name,ipbuf,h->group,h->subgroup,st_name(h->st),h->interval_ms,h->timeout_ms,h->down_threshold,h->enabled,h->fail);
         first=0;
         if(len > (int)cap-1024) break;
     }
@@ -951,6 +1036,12 @@ static void serve_edit_host(SOCKET c, int id, char* body){
     http_reply(c,"text/plain; charset=utf-8","OK");
 }
 
+static void serve_delete_host(SOCKET c, int id){
+    if(id < 1 || id > g_hosts_cap){ http_err(c,404,"host not found"); return; }
+    if(!delete_host(id)){ http_err(c,404,"host not found"); return; }
+    db_delete_host_data(id);
+    http_reply(c,"text/plain; charset=utf-8","OK");
+}
 
 static void serve_host_page(SOCKET c, int id){
     if(id<1 || id>g_hosts_cap || !g_hosts[id-1].used){ http_err(c,404,"not found"); return; }
@@ -958,7 +1049,7 @@ static void serve_host_page(SOCKET c, int id){
         "<!doctype html><html><head><meta charset=utf-8><title>host</title>"
         "<style>body{font-family:system-ui;margin:16px}.row{display:flex;gap:14px}.left{width:360px;border:1px solid #ddd;border-radius:10px;padding:10px}.right{flex:1;border:1px solid #ddd;border-radius:10px;padding:10px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0 10px 0}canvas{width:100%;height:460px;border:1px solid #ddd;background:#fff}#tip{position:fixed;display:none;background:#111;color:#fff;padding:6px 8px;border-radius:6px;font-size:12px;pointer-events:none;z-index:20}input,select,button{font-size:12px}</style></head><body>"
         "<a href='/'>← back</a><h2 id=t></h2><div class=row><div class=left><div id=left></div><hr><h4>Edit host</h4><form id=ef>"
-        "Group <input name=group><br>Subgroup <input name=subgroup><br>"
+        "Group <input name=group><br>Subgroup <input name=subgroup><br>Host name <input name=name><br>Host/IP <input name=addr><br>"
         "Interval (ms) <input name=interval_ms type=number min=50><br>"
         "Timeout (ms) <input name=timeout_ms type=number min=50><br>"
         "Down threshold (fails) <input name=down_threshold type=number min=1><br>"
@@ -1020,7 +1111,7 @@ static void serve_host_page(SOCKET c, int id){
         "document.getElementById('resetBtn').onclick=()=>{setLive(true);go();};"
         "}"
 
-        "function fillEdit(j){if(formLocked||formDirty) return;let f=document.getElementById('ef');f.group.value=j.group;f.subgroup.value=j.subgroup;f.interval_ms.value=j.interval_ms;f.timeout_ms.value=j.timeout_ms;f.down_threshold.value=j.down_threshold;f.enabled.value=j.enabled?1:0;}"
+        "function fillEdit(j){if(formLocked||formDirty) return;let f=document.getElementById('ef');f.group.value=j.group;f.subgroup.value=j.subgroup;f.name.value=j.name||'';f.addr.value=j.ip||'';f.interval_ms.value=j.interval_ms;f.timeout_ms.value=j.timeout_ms;f.down_threshold.value=j.down_threshold;f.enabled.value=j.enabled?1:0;}"
         "async function go(){let r=await fetch('/api/host?id='+id);let j=await r.json();window._lastJ=j;if(!formLocked){document.getElementById('t').textContent=`#${j.id} ${j.name} (${j.ip})`;document.getElementById('left').innerHTML=`<b>Group/Subgroup:</b> ${j.group} / ${j.subgroup}<br><b>Status:</b> ${j.st}<br><b>OK:</b> ${j.ok} <b>Fail(loss):</b> ${j.fail}<br><b>Last:</b> ${j.last} ms<br><b>Avg:</b> ${j.avg} ms<br><b>Min/Max:</b> ${j.min}/${j.max} ms<br><b>Samples(all period):</b> ${j.samples_count}`;}if(!view.start||view.live){let sec=Number(document.getElementById('range').value);let end=(j.samples&&j.samples.length)?j.samples[j.samples.length-1].ts:Math.floor(Date.now()/1000);let start=(sec===0||!j.samples||!j.samples.length)?(j.samples&&j.samples.length?j.samples[0].ts:end-300):Math.max(j.samples[0].ts,end-sec);view.start=start;view.end=end;}fillEdit(j);draw(j);}"
         "document.getElementById('ef').onfocusin=()=>{formLocked=true;};document.getElementById('ef').oninput=()=>{formDirty=true;formLocked=true;};document.getElementById('ef').onsubmit=async (e)=>{e.preventDefault();let q=new URLSearchParams(new FormData(e.target)).toString();let r=await fetch('/api/host/edit?id='+id,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:q});document.getElementById('emsg').textContent=await r.text();formDirty=false;formLocked=false;go();};"
         "bindCanvas();bindToolbar();go();setInterval(()=>{if(view.live && !holdUpdates) go();},2000);"
@@ -1088,15 +1179,53 @@ static DWORD WINAPI http_thread(void* _){
 
     for(;;){
         SOCKET c = accept(ls,NULL,NULL); if(c==INVALID_SOCKET) continue;
-        char req[8192];
-        int n=recv(c,req,sizeof(req)-1,0); if(n<=0){ closesocket(c); continue; }
+        size_t cap = 65536;
+        char* req = (char*)malloc(cap);
+        if(!req){ closesocket(c); continue; }
+        int n=recv(c,req,(int)cap-1,0); if(n<=0){ free(req); closesocket(c); continue; }
         req[n]=0;
 
         char* body = strstr(req, "\r\n\r\n");
         int content_len = 0;
         char* cl = strstr(req, "Content-Length:");
         if(cl) content_len = atoi(cl + 15);
-        if(body){ body += 4; }
+
+        if(starts_with(req,"POST ")){
+            while(!body){
+                if((size_t)n + 1 >= cap){
+                    size_t ncap = cap * 2;
+                    char* nreq = (char*)realloc(req, ncap);
+                    if(!nreq){ break; }
+                    req = nreq; cap = ncap;
+                }
+                int r = recv(c, req+n, (int)cap-1-n, 0);
+                if(r<=0) break;
+                n += r; req[n]=0;
+                body = strstr(req, "\r\n\r\n");
+                cl = strstr(req, "Content-Length:");
+                if(cl) content_len = atoi(cl + 15);
+            }
+            if(body){
+                body += 4;
+                int have = n - (int)(body-req);
+                int need = content_len - have;
+                if(need > 0){
+                    size_t target = (size_t)n + (size_t)need + 1;
+                    if(target > cap){
+                        size_t ncap = cap;
+                        while(ncap < target) ncap *= 2;
+                        char* nreq = (char*)realloc(req, ncap);
+                        if(nreq){ req = nreq; cap = ncap; body = strstr(req, "\r\n\r\n"); if(body) body += 4; }
+                    }
+                    while(body && have < content_len){
+                        int r = recv(c, req+n, (int)cap-1-n, 0);
+                        if(r<=0) break;
+                        n += r; req[n]=0;
+                        have = n - (int)(body-req);
+                    }
+                }
+            }
+        }
 
         if(starts_with(req, "GET ")){
             char* p=req+4; char* sp=strchr(p,' ');
@@ -1114,20 +1243,16 @@ static DWORD WINAPI http_thread(void* _){
             if(!sp || !body){ http_err(c,400,"bad"); }
             else{
                 *sp=0;
-                int have = n - (int)(body-req);
-                while(have < content_len){
-                    int r = recv(c, req+n, (int)sizeof(req)-1-n, 0);
-                    if(r<=0) break;
-                    n += r; req[n]=0; have = n - (int)(body-req);
-                }
                 if(strcmp(p,"/api/host/add")==0) serve_add_host(c, body);
                 else if(starts_with(p,"/api/host/edit")) serve_edit_host(c, parse_qs_id(p), body);
+                else if(starts_with(p,"/api/host/delete")) serve_delete_host(c, parse_qs_id(p));
                 else if(strcmp(p,"/api/import.csv")==0) serve_import_csv(c, body);
                 else if(strcmp(p,"/api/import/preview.csv")==0) serve_import_preview_csv(c, body);
                 else http_err(c,404,"not found");
             }
         }else http_err(c,405,"method");
 
+        free(req);
         closesocket(c);
     }
     return 0;
