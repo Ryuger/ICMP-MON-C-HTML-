@@ -1088,15 +1088,53 @@ static DWORD WINAPI http_thread(void* _){
 
     for(;;){
         SOCKET c = accept(ls,NULL,NULL); if(c==INVALID_SOCKET) continue;
-        char req[8192];
-        int n=recv(c,req,sizeof(req)-1,0); if(n<=0){ closesocket(c); continue; }
+        size_t cap = 65536;
+        char* req = (char*)malloc(cap);
+        if(!req){ closesocket(c); continue; }
+        int n=recv(c,req,(int)cap-1,0); if(n<=0){ free(req); closesocket(c); continue; }
         req[n]=0;
 
         char* body = strstr(req, "\r\n\r\n");
         int content_len = 0;
         char* cl = strstr(req, "Content-Length:");
         if(cl) content_len = atoi(cl + 15);
-        if(body){ body += 4; }
+
+        if(starts_with(req,"POST ")){
+            while(!body){
+                if((size_t)n + 1 >= cap){
+                    size_t ncap = cap * 2;
+                    char* nreq = (char*)realloc(req, ncap);
+                    if(!nreq){ break; }
+                    req = nreq; cap = ncap;
+                }
+                int r = recv(c, req+n, (int)cap-1-n, 0);
+                if(r<=0) break;
+                n += r; req[n]=0;
+                body = strstr(req, "\r\n\r\n");
+                cl = strstr(req, "Content-Length:");
+                if(cl) content_len = atoi(cl + 15);
+            }
+            if(body){
+                body += 4;
+                int have = n - (int)(body-req);
+                int need = content_len - have;
+                if(need > 0){
+                    size_t target = (size_t)n + (size_t)need + 1;
+                    if(target > cap){
+                        size_t ncap = cap;
+                        while(ncap < target) ncap *= 2;
+                        char* nreq = (char*)realloc(req, ncap);
+                        if(nreq){ req = nreq; cap = ncap; body = strstr(req, "\r\n\r\n"); if(body) body += 4; }
+                    }
+                    while(body && have < content_len){
+                        int r = recv(c, req+n, (int)cap-1-n, 0);
+                        if(r<=0) break;
+                        n += r; req[n]=0;
+                        have = n - (int)(body-req);
+                    }
+                }
+            }
+        }
 
         if(starts_with(req, "GET ")){
             char* p=req+4; char* sp=strchr(p,' ');
@@ -1114,12 +1152,6 @@ static DWORD WINAPI http_thread(void* _){
             if(!sp || !body){ http_err(c,400,"bad"); }
             else{
                 *sp=0;
-                int have = n - (int)(body-req);
-                while(have < content_len){
-                    int r = recv(c, req+n, (int)sizeof(req)-1-n, 0);
-                    if(r<=0) break;
-                    n += r; req[n]=0; have = n - (int)(body-req);
-                }
                 if(strcmp(p,"/api/host/add")==0) serve_add_host(c, body);
                 else if(starts_with(p,"/api/host/edit")) serve_edit_host(c, parse_qs_id(p), body);
                 else if(strcmp(p,"/api/import.csv")==0) serve_import_csv(c, body);
@@ -1128,6 +1160,7 @@ static DWORD WINAPI http_thread(void* _){
             }
         }else http_err(c,405,"method");
 
+        free(req);
         closesocket(c);
     }
     return 0;
