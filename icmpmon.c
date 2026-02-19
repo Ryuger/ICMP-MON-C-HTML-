@@ -239,6 +239,21 @@ static int edit_host(int id, const char* name, const char* group, const char* su
     return 1;
 }
 
+static int delete_host(int id){
+    if(id < 1 || id > g_hosts_cap) return 0;
+    AcquireSRWLockExclusive(&g_hosts_lock);
+    Host* h = &g_hosts[id-1];
+    if(!h->used){ ReleaseSRWLockExclusive(&g_hosts_lock); return 0; }
+    h->used = 0;
+    h->enabled = 0;
+    h->queued = 0;
+    InterlockedIncrement(&h->sched_gen);
+    host_reset_stats(h);
+    InterlockedDecrement(&g_n_hosts);
+    ReleaseSRWLockExclusive(&g_hosts_lock);
+    return 1;
+}
+
 static int load_hosts_file(const char* path){
     FILE* f = fopen(path, "rb");
     if(!f){ fprintf(stderr, "hosts: cannot open '%s'\n", path); return -1; }
@@ -401,6 +416,44 @@ static void db_sync_hosts(void){
     sqlite3_finalize(st);
     if(ok) db_exec(db, "COMMIT;");
     else db_exec(db, "ROLLBACK;");
+    sqlite3_close(db);
+}
+
+static void db_delete_host_data(int id){
+    sqlite3* db = NULL;
+    sqlite3_stmt* st_hosts = NULL;
+    sqlite3_stmt* st_samples = NULL;
+    sqlite3_stmt* st_events = NULL;
+    if(sqlite3_open(g_db_path, &db) != SQLITE_OK){ if(db) sqlite3_close(db); return; }
+    sqlite3_busy_timeout(db, 3000);
+    if(db_exec(db, "BEGIN;") != SQLITE_OK){ sqlite3_close(db); return; }
+    if(sqlite3_prepare_v2(db, "DELETE FROM hosts WHERE host_id=?", -1, &st_hosts, NULL) != SQLITE_OK ||
+       sqlite3_prepare_v2(db, "DELETE FROM samples WHERE host_id=?", -1, &st_samples, NULL) != SQLITE_OK ||
+       sqlite3_prepare_v2(db, "DELETE FROM events WHERE host_id=?", -1, &st_events, NULL) != SQLITE_OK){
+        if(st_hosts) sqlite3_finalize(st_hosts);
+        if(st_samples) sqlite3_finalize(st_samples);
+        if(st_events) sqlite3_finalize(st_events);
+        db_exec(db, "ROLLBACK;");
+        sqlite3_close(db);
+        return;
+    }
+
+    sqlite3_bind_int(st_hosts, 1, id);
+    sqlite3_step(st_hosts);
+    sqlite3_reset(st_hosts);
+
+    sqlite3_bind_int(st_samples, 1, id);
+    sqlite3_step(st_samples);
+    sqlite3_reset(st_samples);
+
+    sqlite3_bind_int(st_events, 1, id);
+    sqlite3_step(st_events);
+    sqlite3_reset(st_events);
+
+    sqlite3_finalize(st_hosts);
+    sqlite3_finalize(st_samples);
+    sqlite3_finalize(st_events);
+    if(db_exec(db, "COMMIT;") != SQLITE_OK) db_exec(db, "ROLLBACK;");
     sqlite3_close(db);
 }
 
@@ -681,11 +734,10 @@ static void serve_index(SOCKET c){
         "function render(j){window._last=j;document.getElementById('meta').textContent=`hosts=${j.hosts} up=${j.up} down=${j.down} unk=${j.unk}`;drawTabs(j.list);"
         "let tb=document.getElementById('tb');tb.innerHTML='';let arr=j.list.filter(h=>(h.group||'Default')===selectedGroup);arr.sort((a,b)=>(a.subgroup||'').localeCompare(b.subgroup||'')||a.id-b.id);let cur='';"
         "for(let h of arr){if(h.subgroup!==cur){cur=h.subgroup;let sh=document.createElement('tr');sh.className='subhead';sh.innerHTML=`<td colspan=10>${selectedGroup} / ${cur||'Main'}</td>`;tb.appendChild(sh);}"
-        "let cls=h.st=='UP'?'up':(h.st=='DOWN'?'down':'unk');let tr=document.createElement('tr');tr.innerHTML=`<td>${h.id}</td><td>${h.group}</td><td>${h.subgroup}</td><td>${h.name}<br><small>${h.ip||''}</small></td><td class='${cls}'>${h.st}</td><td>${h.interval_ms}</td><td>${h.timeout_ms}</td><td>${h.down_threshold}</td><td>${h.fail||0}</td><td><a href='/host?id=${h.id}'>Open</a></td>`;tb.appendChild(tr);}"
+        "let cls=h.st=='UP'?'up':(h.st=='DOWN'?'down':'unk');let tr=document.createElement('tr');tr.innerHTML=`<td>${h.id}</td><td>${h.group}</td><td>${h.subgroup}</td><td>${h.name}<br><small>${h.ip||''}</small></td><td class='${cls}'>${h.st}</td><td>${h.interval_ms}</td><td>${h.timeout_ms}</td><td>${h.down_threshold}</td><td>${h.fail||0}</td><td><a href='/host?id=${h.id}'>Open</a> <button onclick='deleteHost(${h.id})'>Delete</button></td>`;tb.appendChild(tr);}"
         "}"
         "async function go(){let r=await fetch('/api/hosts');let j=await r.json();render(j);}"
-        "async function addHost(ev){ev.preventDefault();let r=await fetch('/api/host/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:enc(ev.target)});document.getElementById('addmsg').textContent=await r.text();go();}"
-        "async function previewCsv(){let f=document.getElementById('f').files[0];if(!f)return;let txt=await f.text();let r=await fetch('/api/import/preview.csv',{method:'POST',headers:{'Content-Type':'text/csv'},body:txt});let j=await r.json();document.getElementById('impmsg').textContent=`can_import=${j.preview_can_import} bad=${j.bad} dup_existing=${j.duplicates_existing} dup_file=${j.duplicates_file}`;let lines=(j.details||[]).map(d=>`line ${d.line}: ${d.host||'(empty)'} -> ${d.reason}`);document.getElementById('impdetail').textContent=lines.length?lines.join('\\n'):'No conflicts';}"
+        "async function addHost(ev){ev.preventDefault();let r=await fetch('/api/host/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:enc(ev.target)});document.getElementById('addmsg').textContent=await r.text();go();}async function deleteHost(id){let h=(window._last&&window._last.list||[]).find(x=>x.id===id);let q=`${h&&h.group||''}, ${h&&h.subgroup||''}, ${h&&(h.ip||h.name)||''}? удалить или отмена`;if(!confirm(q))return;let r=await fetch('/api/host/delete?id='+id,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:''});document.getElementById('addmsg').textContent=await r.text();go();}async function previewCsv(){let f=document.getElementById('f').files[0];if(!f)return;let txt=await f.text();let r=await fetch('/api/import/preview.csv',{method:'POST',headers:{'Content-Type':'text/csv'},body:txt});let j=await r.json();document.getElementById('impmsg').textContent=`can_import=${j.preview_can_import} bad=${j.bad} dup_existing=${j.duplicates_existing} dup_file=${j.duplicates_file}`;let lines=(j.details||[]).map(d=>`line ${d.line}: ${d.host||'(empty)'} -> ${d.reason}`);document.getElementById('impdetail').textContent=lines.length?lines.join('\\n'):'No conflicts';}"
         "async function importCsv(){let f=document.getElementById('f').files[0];if(!f)return;let txt=await f.text();let r=await fetch('/api/import.csv',{method:'POST',headers:{'Content-Type':'text/csv'},body:txt});document.getElementById('impmsg').textContent=await r.text();go();}"
         "document.getElementById('addf').onsubmit=addHost;go();setInterval(go,1500);"
         "</script></body></html>";
@@ -705,9 +757,12 @@ static void serve_api_hosts(SOCKET c){
     for(int i=0;i<g_hosts_cap;i++){
         Host* h=&g_hosts[i];
         if(!h->used) continue;
+        char ipbuf[32];
+        struct in_addr ia; ia.S_un.S_addr = h->ip;
+        _snprintf_s(ipbuf, sizeof(ipbuf), _TRUNCATE, "%s", inet_ntoa(ia));
         len += _snprintf_s(buf+len, cap-len, _TRUNCATE,
-            "%s{\"id\":%d,\"name\":\"%s\",\"group\":\"%s\",\"subgroup\":\"%s\",\"st\":\"%s\",\"interval_ms\":%ld,\"timeout_ms\":%ld,\"down_threshold\":%ld,\"enabled\":%d}",
-            first?"":",",i+1,h->name,h->group,h->subgroup,st_name(h->st),h->interval_ms,h->timeout_ms,h->down_threshold,h->enabled);
+            "%s{\"id\":%d,\"name\":\"%s\",\"ip\":\"%s\",\"group\":\"%s\",\"subgroup\":\"%s\",\"st\":\"%s\",\"interval_ms\":%ld,\"timeout_ms\":%ld,\"down_threshold\":%ld,\"enabled\":%d,\"fail\":%ld}",
+            first?"":",",i+1,h->name,ipbuf,h->group,h->subgroup,st_name(h->st),h->interval_ms,h->timeout_ms,h->down_threshold,h->enabled,h->fail);
         first=0;
         if(len > (int)cap-1024) break;
     }
@@ -981,6 +1036,12 @@ static void serve_edit_host(SOCKET c, int id, char* body){
     http_reply(c,"text/plain; charset=utf-8","OK");
 }
 
+static void serve_delete_host(SOCKET c, int id){
+    if(id < 1 || id > g_hosts_cap){ http_err(c,404,"host not found"); return; }
+    if(!delete_host(id)){ http_err(c,404,"host not found"); return; }
+    db_delete_host_data(id);
+    http_reply(c,"text/plain; charset=utf-8","OK");
+}
 
 static void serve_host_page(SOCKET c, int id){
     if(id<1 || id>g_hosts_cap || !g_hosts[id-1].used){ http_err(c,404,"not found"); return; }
@@ -1184,6 +1245,7 @@ static DWORD WINAPI http_thread(void* _){
                 *sp=0;
                 if(strcmp(p,"/api/host/add")==0) serve_add_host(c, body);
                 else if(starts_with(p,"/api/host/edit")) serve_edit_host(c, parse_qs_id(p), body);
+                else if(starts_with(p,"/api/host/delete")) serve_delete_host(c, parse_qs_id(p));
                 else if(strcmp(p,"/api/import.csv")==0) serve_import_csv(c, body);
                 else if(strcmp(p,"/api/import/preview.csv")==0) serve_import_preview_csv(c, body);
                 else http_err(c,404,"not found");
