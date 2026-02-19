@@ -419,6 +419,40 @@ static void db_sync_hosts(void){
     sqlite3_close(db);
 }
 
+static void db_upsert_host(int id){
+    if(id < 1 || id > g_hosts_cap) return;
+
+    Host snap;
+    ZeroMemory(&snap, sizeof(snap));
+    AcquireSRWLockShared(&g_hosts_lock);
+    Host* h = &g_hosts[id-1];
+    if(h->used) snap = *h;
+    ReleaseSRWLockShared(&g_hosts_lock);
+    if(!snap.used) return;
+
+    sqlite3* db = NULL;
+    sqlite3_stmt* st = NULL;
+    if(sqlite3_open(g_db_path, &db) != SQLITE_OK){ if(db) sqlite3_close(db); return; }
+    sqlite3_busy_timeout(db, 3000);
+    if(sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO hosts(host_id,name,ip,grp,subgrp,interval_ms,timeout_ms,down_threshold,enabled) VALUES(?,?,?,?,?,?,?,?,?)", -1, &st, NULL) == SQLITE_OK){
+        char ipbuf[32];
+        struct in_addr ia; ia.S_un.S_addr = snap.ip;
+        _snprintf_s(ipbuf, sizeof(ipbuf), _TRUNCATE, "%s", inet_ntoa(ia));
+        sqlite3_bind_int(st, 1, id);
+        sqlite3_bind_text(st, 2, snap.name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, ipbuf, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 4, snap.group, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 5, snap.subgroup, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 6, snap.interval_ms);
+        sqlite3_bind_int(st, 7, snap.timeout_ms);
+        sqlite3_bind_int(st, 8, snap.down_threshold);
+        sqlite3_bind_int(st, 9, snap.enabled);
+        sqlite3_step(st);
+    }
+    if(st) sqlite3_finalize(st);
+    sqlite3_close(db);
+}
+
 static void db_delete_host_data(int id){
     sqlite3* db = NULL;
     sqlite3_stmt* st_hosts = NULL;
@@ -1003,7 +1037,7 @@ static void serve_add_host(SOCKET c, char* body){
     heap_push(n);
     ReleaseSRWLockExclusive(&g_sched_lock);
 
-    db_sync_hosts();
+    db_upsert_host(id);
     http_reply(c,"text/plain; charset=utf-8","OK");
 }
 
@@ -1032,7 +1066,7 @@ static void serve_edit_host(SOCKET c, int id, char* body){
         ReleaseSRWLockExclusive(&g_sched_lock);
     }
 
-    db_sync_hosts();
+    db_upsert_host(id);
     http_reply(c,"text/plain; charset=utf-8","OK");
 }
 
