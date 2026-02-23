@@ -341,7 +341,7 @@ static int q_take(void){
 }
 
 /* DB */
-typedef enum { DB_SAMPLE=1, DB_EVENT=2, DB_STOP=3 } DbType;
+typedef enum { DB_SAMPLE=1, DB_EVENT=2, DB_DELETE_HOST=3, DB_STOP=4 } DbType;
 typedef struct DbMsg {
     SLIST_ENTRY e;
     DbType type;
@@ -419,41 +419,37 @@ static void db_sync_hosts(void){
     sqlite3_close(db);
 }
 
-static void db_delete_host_data(int id){
+static void db_upsert_host(int id){
+    if(id < 1 || id > g_hosts_cap) return;
+
+    Host snap;
+    ZeroMemory(&snap, sizeof(snap));
+    AcquireSRWLockShared(&g_hosts_lock);
+    Host* h = &g_hosts[id-1];
+    if(h->used) snap = *h;
+    ReleaseSRWLockShared(&g_hosts_lock);
+    if(!snap.used) return;
+
     sqlite3* db = NULL;
-    sqlite3_stmt* st_hosts = NULL;
-    sqlite3_stmt* st_samples = NULL;
-    sqlite3_stmt* st_events = NULL;
+    sqlite3_stmt* st = NULL;
     if(sqlite3_open(g_db_path, &db) != SQLITE_OK){ if(db) sqlite3_close(db); return; }
     sqlite3_busy_timeout(db, 3000);
-    if(db_exec(db, "BEGIN;") != SQLITE_OK){ sqlite3_close(db); return; }
-    if(sqlite3_prepare_v2(db, "DELETE FROM hosts WHERE host_id=?", -1, &st_hosts, NULL) != SQLITE_OK ||
-       sqlite3_prepare_v2(db, "DELETE FROM samples WHERE host_id=?", -1, &st_samples, NULL) != SQLITE_OK ||
-       sqlite3_prepare_v2(db, "DELETE FROM events WHERE host_id=?", -1, &st_events, NULL) != SQLITE_OK){
-        if(st_hosts) sqlite3_finalize(st_hosts);
-        if(st_samples) sqlite3_finalize(st_samples);
-        if(st_events) sqlite3_finalize(st_events);
-        db_exec(db, "ROLLBACK;");
-        sqlite3_close(db);
-        return;
+    if(sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO hosts(host_id,name,ip,grp,subgrp,interval_ms,timeout_ms,down_threshold,enabled) VALUES(?,?,?,?,?,?,?,?,?)", -1, &st, NULL) == SQLITE_OK){
+        char ipbuf[32];
+        struct in_addr ia; ia.S_un.S_addr = snap.ip;
+        _snprintf_s(ipbuf, sizeof(ipbuf), _TRUNCATE, "%s", inet_ntoa(ia));
+        sqlite3_bind_int(st, 1, id);
+        sqlite3_bind_text(st, 2, snap.name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, ipbuf, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 4, snap.group, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 5, snap.subgroup, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 6, snap.interval_ms);
+        sqlite3_bind_int(st, 7, snap.timeout_ms);
+        sqlite3_bind_int(st, 8, snap.down_threshold);
+        sqlite3_bind_int(st, 9, snap.enabled);
+        sqlite3_step(st);
     }
-
-    sqlite3_bind_int(st_hosts, 1, id);
-    sqlite3_step(st_hosts);
-    sqlite3_reset(st_hosts);
-
-    sqlite3_bind_int(st_samples, 1, id);
-    sqlite3_step(st_samples);
-    sqlite3_reset(st_samples);
-
-    sqlite3_bind_int(st_events, 1, id);
-    sqlite3_step(st_events);
-    sqlite3_reset(st_events);
-
-    sqlite3_finalize(st_hosts);
-    sqlite3_finalize(st_samples);
-    sqlite3_finalize(st_events);
-    if(db_exec(db, "COMMIT;") != SQLITE_OK) db_exec(db, "ROLLBACK;");
+    if(st) sqlite3_finalize(st);
     sqlite3_close(db);
 }
 
@@ -514,13 +510,22 @@ static DWORD WINAPI db_thread(void* _){
     sqlite3* db = NULL;
     sqlite3_stmt* st_sample = NULL;
     sqlite3_stmt* st_event = NULL;
+    sqlite3_stmt* st_del_hosts = NULL;
+    sqlite3_stmt* st_del_samples = NULL;
+    sqlite3_stmt* st_del_events = NULL;
     int tx_open = 0;
     if(sqlite3_open(g_db_path, &db) != SQLITE_OK){ InterlockedExchange(&g_db_enabled, 0); if(db) sqlite3_close(db); return 0; }
     sqlite3_busy_timeout(db, 3000);
     if(sqlite3_prepare_v2(db, "INSERT INTO samples(ts,host_id,rtt_ms,timeout_ms) VALUES(?,?,?,?)", -1, &st_sample, NULL) != SQLITE_OK ||
-       sqlite3_prepare_v2(db, "INSERT INTO events(ts,host_id,old_status,new_status,detail) VALUES(?,?,?,?,?)", -1, &st_event, NULL) != SQLITE_OK){
+       sqlite3_prepare_v2(db, "INSERT INTO events(ts,host_id,old_status,new_status,detail) VALUES(?,?,?,?,?)", -1, &st_event, NULL) != SQLITE_OK ||
+       sqlite3_prepare_v2(db, "DELETE FROM hosts WHERE host_id=?", -1, &st_del_hosts, NULL) != SQLITE_OK ||
+       sqlite3_prepare_v2(db, "DELETE FROM samples WHERE host_id=?", -1, &st_del_samples, NULL) != SQLITE_OK ||
+       sqlite3_prepare_v2(db, "DELETE FROM events WHERE host_id=?", -1, &st_del_events, NULL) != SQLITE_OK){
         if(st_sample) sqlite3_finalize(st_sample);
         if(st_event) sqlite3_finalize(st_event);
+        if(st_del_hosts) sqlite3_finalize(st_del_hosts);
+        if(st_del_samples) sqlite3_finalize(st_del_samples);
+        if(st_del_events) sqlite3_finalize(st_del_events);
         sqlite3_close(db);
         InterlockedExchange(&g_db_enabled, 0);
         return 0;
@@ -551,6 +556,24 @@ static DWORD WINAPI db_thread(void* _){
             sqlite3_bind_text(st_event,5,m->detail,-1,SQLITE_TRANSIENT);
             sqlite3_step(st_event);
             sqlite3_reset(st_event);
+        }else if(m->type == DB_DELETE_HOST){
+            sqlite3_reset(st_del_hosts);
+            sqlite3_clear_bindings(st_del_hosts);
+            sqlite3_bind_int(st_del_hosts,1,m->host_id);
+            sqlite3_step(st_del_hosts);
+            sqlite3_reset(st_del_hosts);
+
+            sqlite3_reset(st_del_samples);
+            sqlite3_clear_bindings(st_del_samples);
+            sqlite3_bind_int(st_del_samples,1,m->host_id);
+            sqlite3_step(st_del_samples);
+            sqlite3_reset(st_del_samples);
+
+            sqlite3_reset(st_del_events);
+            sqlite3_clear_bindings(st_del_events);
+            sqlite3_bind_int(st_del_events,1,m->host_id);
+            sqlite3_step(st_del_events);
+            sqlite3_reset(st_del_events);
         }
         free(m);
         batch++;
@@ -567,6 +590,9 @@ static DWORD WINAPI db_thread(void* _){
     }
     if(st_sample) sqlite3_finalize(st_sample);
     if(st_event) sqlite3_finalize(st_event);
+    if(st_del_hosts) sqlite3_finalize(st_del_hosts);
+    if(st_del_samples) sqlite3_finalize(st_del_samples);
+    if(st_del_events) sqlite3_finalize(st_del_events);
     sqlite3_close(db);
     return 0;
 }
@@ -582,6 +608,12 @@ static void db_emit_event(int host_id, u32 ts, int old_st, int new_st, const cha
     DbMsg* m = (DbMsg*)calloc(1,sizeof(DbMsg)); if(!m) return;
     m->type = DB_EVENT; m->host_id = host_id; m->ts = ts; m->old_st = old_st; m->new_st = new_st;
     _snprintf_s(m->detail,sizeof(m->detail),_TRUNCATE,"%s",detail?detail:"");
+    db_post(m);
+}
+static void db_emit_delete_host(int host_id){
+    if(!g_db_enabled) return;
+    DbMsg* m = (DbMsg*)calloc(1,sizeof(DbMsg)); if(!m) return;
+    m->type = DB_DELETE_HOST; m->host_id = host_id;
     db_post(m);
 }
 
@@ -1003,7 +1035,7 @@ static void serve_add_host(SOCKET c, char* body){
     heap_push(n);
     ReleaseSRWLockExclusive(&g_sched_lock);
 
-    db_sync_hosts();
+    db_upsert_host(id);
     http_reply(c,"text/plain; charset=utf-8","OK");
 }
 
@@ -1032,14 +1064,14 @@ static void serve_edit_host(SOCKET c, int id, char* body){
         ReleaseSRWLockExclusive(&g_sched_lock);
     }
 
-    db_sync_hosts();
+    db_upsert_host(id);
     http_reply(c,"text/plain; charset=utf-8","OK");
 }
 
 static void serve_delete_host(SOCKET c, int id){
     if(id < 1 || id > g_hosts_cap){ http_err(c,404,"host not found"); return; }
     if(!delete_host(id)){ http_err(c,404,"host not found"); return; }
-    db_delete_host_data(id);
+    db_emit_delete_host(id);
     http_reply(c,"text/plain; charset=utf-8","OK");
 }
 
