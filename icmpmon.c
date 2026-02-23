@@ -80,8 +80,16 @@ static u32 g_history_len = 512;
 static u32 g_http_port = 8080;
 static const char* g_db_path = "icmpmon.db";
 static volatile LONG g_db_enabled = 1;
+static ULONG g_http_bind_ip = htonl(INADDR_LOOPBACK);
+static char g_http_bind_ip_text[16] = "127.0.0.1";
 
 static HANDLE g_con = NULL;
+
+typedef struct IfaceChoice {
+    ULONG ip;
+    char ip_text[16];
+    char name[160];
+} IfaceChoice;
 
 static __forceinline u64 qpc_now(void){ LARGE_INTEGER t; QueryPerformanceCounter(&t); return (u64)t.QuadPart; }
 static __forceinline u64 ms_to_qpc(u32 ms){ return ((u64)ms * (u64)g_qpf.QuadPart) / 1000ULL; }
@@ -120,6 +128,91 @@ static int resolve_v4(const char* s, ULONG* out_ip){
     if(getaddrinfo(s, 0, &hints, &ai) != 0 || !ai) return 0;
     *out_ip = ((struct sockaddr_in*)ai->ai_addr)->sin_addr.S_un.S_addr;
     freeaddrinfo(ai);
+    return 1;
+}
+
+static int choose_http_interface(void){
+    ULONG size = 15 * 1024;
+    IP_ADAPTER_ADDRESSES* aa = (IP_ADAPTER_ADDRESSES*)malloc(size);
+    if(!aa) return 0;
+
+    DWORD rc = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, NULL, aa, &size);
+    if(rc == ERROR_BUFFER_OVERFLOW){
+        IP_ADAPTER_ADDRESSES* naa = (IP_ADAPTER_ADDRESSES*)realloc(aa, size);
+        if(!naa){ free(aa); return 0; }
+        aa = naa;
+        rc = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, NULL, aa, &size);
+    }
+    if(rc != NO_ERROR){
+        free(aa);
+        return 0;
+    }
+
+    IfaceChoice* list = (IfaceChoice*)calloc(64, sizeof(IfaceChoice));
+    int cap = 64;
+    int n = 0;
+
+    for(IP_ADAPTER_ADDRESSES* it = aa; it; it = it->Next){
+        if(it->OperStatus != IfOperStatusUp) continue;
+        if(it->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+
+        for(IP_ADAPTER_UNICAST_ADDRESS* ua = it->FirstUnicastAddress; ua; ua = ua->Next){
+            if(!ua->Address.lpSockaddr || ua->Address.lpSockaddr->sa_family != AF_INET) continue;
+            struct sockaddr_in* sin = (struct sockaddr_in*)ua->Address.lpSockaddr;
+            ULONG ip = sin->sin_addr.S_un.S_addr;
+            if(ip == 0 || ip == htonl(INADDR_LOOPBACK)) continue;
+
+            if(n >= cap){
+                int ncap = cap * 2;
+                IfaceChoice* nlist = (IfaceChoice*)realloc(list, (size_t)ncap * sizeof(IfaceChoice));
+                if(!nlist) break;
+                list = nlist;
+                cap = ncap;
+            }
+            if(n >= cap) break;
+
+            IfaceChoice* c = &list[n++];
+            c->ip = ip;
+            InetNtopA(AF_INET, &sin->sin_addr, c->ip_text, sizeof(c->ip_text));
+            if(it->FriendlyName && *it->FriendlyName){
+                WideCharToMultiByte(CP_UTF8, 0, it->FriendlyName, -1, c->name, (int)sizeof(c->name), NULL, NULL);
+            }else if(it->AdapterName){
+                _snprintf_s(c->name, sizeof(c->name), _TRUNCATE, "%s", it->AdapterName);
+            }else{
+                _snprintf_s(c->name, sizeof(c->name), _TRUNCATE, "iface");
+            }
+        }
+    }
+
+    if(n <= 0){
+        free(list);
+        free(aa);
+        fprintf(stderr, "Нет активных внешних IPv4-интерфейсов, сервер останется на 127.0.0.1\n");
+        return 0;
+    }
+
+    fprintf(stderr, "Доступные интерфейсы для HTTP сервера:\n");
+    for(int i=0;i<n;i++){
+        fprintf(stderr, "  %d) %s (%s)\n", i+1, list[i].name, list[i].ip_text);
+    }
+    fprintf(stderr, "Выберите номер интерфейса [1-%d, Enter=1]: ", n);
+
+    char line[64] = {0};
+    int sel = 1;
+    if(fgets(line, sizeof(line), stdin)){
+        char* t = trim_a(line);
+        if(*t){
+            int v = atoi(t);
+            if(v >= 1 && v <= n) sel = v;
+        }
+    }
+
+    g_http_bind_ip = list[sel-1].ip;
+    _snprintf_s(g_http_bind_ip_text, sizeof(g_http_bind_ip_text), _TRUNCATE, "%s", list[sel-1].ip_text);
+    fprintf(stderr, "HTTP будет запущен на %s\n", g_http_bind_ip_text);
+
+    free(list);
+    free(aa);
     return 1;
 }
 
@@ -1205,9 +1298,9 @@ static DWORD WINAPI http_thread(void* _){
     int opt = 1;
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
     struct sockaddr_in a; ZeroMemory(&a,sizeof(a));
-    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons((u_short)g_http_port);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = g_http_bind_ip; a.sin_port = htons((u_short)g_http_port);
     if(bind(ls,(struct sockaddr*)&a,sizeof(a))==SOCKET_ERROR || listen(ls,64)==SOCKET_ERROR){ closesocket(ls); return 0; }
-    fprintf(stderr,"HTTP: http://127.0.0.1:%u/\n",g_http_port);
+    fprintf(stderr,"HTTP: http://%s:%u/\n", g_http_bind_ip_text, g_http_port);
 
     for(;;){
         SOCKET c = accept(ls,NULL,NULL); if(c==INVALID_SOCKET) continue;
@@ -1315,6 +1408,8 @@ int main(int argc, char** argv){
     WSADATA w;
     if(WSAStartup(MAKEWORD(2,2), &w) != 0) return 1;
     QueryPerformanceFrequency(&g_qpf);
+
+    choose_http_interface();
 
     InitializeSRWLock(&g_hosts_lock);
     InitializeSRWLock(&g_sched_lock);
