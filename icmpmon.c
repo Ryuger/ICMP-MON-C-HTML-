@@ -187,15 +187,15 @@ static int choose_http_interface(void){
     if(n <= 0){
         free(list);
         free(aa);
-        fprintf(stderr, "Нет активных внешних IPv4-интерфейсов, сервер останется на 127.0.0.1\n");
+        fprintf(stderr, "No active external IPv4 interfaces found, keeping HTTP on 127.0.0.1\n");
         return 0;
     }
 
-    fprintf(stderr, "Доступные интерфейсы для HTTP сервера:\n");
+    fprintf(stderr, "Available interfaces for HTTP server:\n");
     for(int i=0;i<n;i++){
         fprintf(stderr, "  %d) %s (%s)\n", i+1, list[i].name, list[i].ip_text);
     }
-    fprintf(stderr, "Выберите номер интерфейса [1-%d, Enter=1]: ", n);
+    fprintf(stderr, "Select interface number [1-%d, Enter=1]: ", n);
 
     char line[64] = {0};
     int sel = 1;
@@ -209,7 +209,7 @@ static int choose_http_interface(void){
 
     g_http_bind_ip = list[sel-1].ip;
     _snprintf_s(g_http_bind_ip_text, sizeof(g_http_bind_ip_text), _TRUNCATE, "%s", list[sel-1].ip_text);
-    fprintf(stderr, "HTTP будет запущен на %s\n", g_http_bind_ip_text);
+    fprintf(stderr, "HTTP will listen on %s\n", g_http_bind_ip_text);
 
     free(list);
     free(aa);
