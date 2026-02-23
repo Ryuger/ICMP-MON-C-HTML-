@@ -175,7 +175,11 @@ static int choose_http_interface(void){
             c->ip = ip;
             InetNtopA(AF_INET, &sin->sin_addr, c->ip_text, sizeof(c->ip_text));
             if(it->FriendlyName && *it->FriendlyName){
-                WideCharToMultiByte(CP_UTF8, 0, it->FriendlyName, -1, c->name, (int)sizeof(c->name), NULL, NULL);
+                UINT out_cp = GetConsoleOutputCP();
+                if(out_cp == 0) out_cp = GetACP();
+                if(!WideCharToMultiByte(out_cp, 0, it->FriendlyName, -1, c->name, (int)sizeof(c->name), NULL, NULL)){
+                    _snprintf_s(c->name, sizeof(c->name), _TRUNCATE, "iface");
+                }
             }else if(it->AdapterName){
                 _snprintf_s(c->name, sizeof(c->name), _TRUNCATE, "%s", it->AdapterName);
             }else{
