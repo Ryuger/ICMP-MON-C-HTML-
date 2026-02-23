@@ -80,7 +80,7 @@ static u32 g_history_len = 512;
 static u32 g_http_port = 8080;
 static const char* g_db_path = "icmpmon.db";
 static volatile LONG g_db_enabled = 1;
-static ULONG g_http_bind_ip = htonl(INADDR_LOOPBACK);
+static ULONG g_http_bind_ip = 0;
 static char g_http_bind_ip_text[16] = "127.0.0.1";
 
 static HANDLE g_con = NULL;
@@ -1408,6 +1408,8 @@ int main(int argc, char** argv){
     WSADATA w;
     if(WSAStartup(MAKEWORD(2,2), &w) != 0) return 1;
     QueryPerformanceFrequency(&g_qpf);
+
+    g_http_bind_ip = htonl(INADDR_LOOPBACK);
 
     choose_http_interface();
 
